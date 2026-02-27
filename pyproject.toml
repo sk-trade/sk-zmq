@@ -1,0 +1,14 @@
+[project]
+name = "sk-zmq"
+version = "0.1.0"
+description = "Reusable ZMQ client for candle stream subscriptions"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+    "pyzmq",
+    "orjson",
+]
+
+[tool.setuptools]
+packages = ["sk_zmq"]
