@@ -37,6 +37,7 @@ class ZMQClient:
         server_candle_ttl: int = 300,
         candle_deque_maxlen: int = 200,
         on_critical: Optional[Callable[[str], None]] = None,
+        callback_snapshot_mode: str = "deque_copy",
     ):
         """
         ZMQClient 인스턴스를 초기화합니다.
@@ -56,6 +57,10 @@ class ZMQClient:
             server_candle_ttl (int): 서버 캔들 구독 TTL (초). 기본값 300.
             candle_deque_maxlen (int): 캔들 덱 최대 길이. 기본값 200.
             on_critical (Optional[Callable[[str], None]]): 치명적 이벤트 시 호출될 콜백.
+            callback_snapshot_mode (str): 콜백에 전달할 스냅샷 모드.
+                "live": 내부 deque를 그대로 전달
+                "deque_copy": deque 컨테이너만 복사 (원소는 공유)
+                "deep_copy": 원소 dict까지 복사
         """
         self.client_id = client_id
         self.symbol = symbol
@@ -68,6 +73,7 @@ class ZMQClient:
         self.server_candle_ttl = server_candle_ttl
         self.candle_deque_maxlen = candle_deque_maxlen
         self.on_critical = on_critical
+        self.callback_snapshot_mode = callback_snapshot_mode
 
         self.context = zmq.Context()
         self.stop_event = threading.Event()
@@ -80,7 +86,29 @@ class ZMQClient:
         self.candle_deques: Dict[str, deque] = {
             interval: deque(maxlen=self.candle_deque_maxlen) for interval in self.intervals
         }
+        self._validate_callback_snapshot_mode()
         self.threads: List[threading.Thread] = []
+
+    def _validate_callback_snapshot_mode(self) -> None:
+        valid_modes = {"live", "deque_copy", "deep_copy"}
+        if self.callback_snapshot_mode not in valid_modes:
+            raise ValueError(
+                "Invalid callback_snapshot_mode. "
+                "Expected one of: live, deque_copy, deep_copy."
+            )
+
+    def _build_callback_payload(self) -> Dict[str, deque]:
+        with self.storage_lock:
+            if self.callback_snapshot_mode == "live":
+                return self.candle_deques
+            if self.callback_snapshot_mode == "deque_copy":
+                return {
+                    k: deque(v, maxlen=v.maxlen) for k, v in self.candle_deques.items()
+                }
+            return {
+                k: deque([dict(c) for c in v], maxlen=v.maxlen)
+                for k, v in self.candle_deques.items()
+            }
 
     def _send_request(self, request: dict, max_retries: int = 5, initial_delay: int = 2) -> Optional[dict]:
         """
@@ -244,8 +272,8 @@ class ZMQClient:
                 if self.data_updated_event.is_set():
                     self.data_updated_event.clear()
                     try:
-                        with self.storage_lock:
-                            self.candle_handler_callback(self.candle_deques)
+                        payload = self._build_callback_payload()
+                        self.candle_handler_callback(payload)
                     except Exception as e:
                         logger.error(f"전략 콜백 함수 실행 중 오류: {e}", exc_info=True)
         else:
@@ -253,8 +281,8 @@ class ZMQClient:
                 if self.data_updated_event.wait(timeout=1):
                     self.data_updated_event.clear()
                     try:
-                        with self.storage_lock:
-                            self.candle_handler_callback(self.candle_deques)
+                        payload = self._build_callback_payload()
+                        self.candle_handler_callback(payload)
                     except Exception as e:
                         logger.error(f"전략 콜백 함수 실행 중 오류: {e}", exc_info=True)
 
