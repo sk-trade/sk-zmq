@@ -30,7 +30,7 @@ def on_critical(msg: str):
 client = ZMQClient(
     client_id="my-client",
     symbol="KRW-BTC",
-    intervals=["minute1", "minute5"],
+    intervals=["1m", "3m", "5m"],
     candle_handler_callback=on_candle_update,
     throttle_seconds=0.1,
     zmq_gateway_host="127.0.0.1",
@@ -40,12 +40,21 @@ client = ZMQClient(
     candle_deque_maxlen=200,
     on_critical=on_critical,
     callback_snapshot_mode="live",  # "live", "deque_copy", "deep_copy"
+    exchange="upbit",
 )
 
 client.start()
 ```
 
 ## Callback snapshot modes
+
+## Exchange and payload expectations
+
+Set `exchange` to select the topic prefix (e.g., `UPBIT`). Other exchanges are supported by changing this value.
+
+The gateway now publishes candle events with an envelope that includes `candle` (and `new` for CLOSE).
+Reconcile events replace candles by matching `ts`.
+
 
 The callback now runs outside the internal storage lock.
 Depending on your needs, choose how data is passed into the callback:
@@ -61,7 +70,7 @@ Treat the callback payload as read-only unless using deep_copy.
 client = ZMQClient(
     client_id="my-client",
     symbol="KRW-BTC",
-    intervals=["minute1", "minute5"],
+    intervals=["1m", "3m", "5m"],
     candle_handler_callback=on_candle_update,
     throttle_seconds=0.1,
     zmq_gateway_host="127.0.0.1",
@@ -71,6 +80,7 @@ client = ZMQClient(
     candle_deque_maxlen=200,
     on_critical=on_critical,
     callback_snapshot_mode="deque_copy",
+    exchange="upbit",
 )
 
 # concurrency-safe access pattern (inside callback)

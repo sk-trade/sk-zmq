@@ -38,6 +38,7 @@ class ZMQClient:
         candle_deque_maxlen: int = 200,
         on_critical: Optional[Callable[[str], None]] = None,
         callback_snapshot_mode: str = "deque_copy",
+        exchange: str = "upbit",
     ):
         """
         ZMQClient 인스턴스를 초기화합니다.
@@ -45,7 +46,7 @@ class ZMQClient:
         Args:
             client_id (str): 게이트웨이에서 클라이언트를 식별하기 위한 고유 ID.
             symbol (str): 거래할 자산의 심볼 (예: "KRW-BTC").
-            intervals (List[str]): 구독할 캔들의 시간 간격 리스트 (예: ["minute1", "minute5"]).
+            intervals (List[str]): 구독할 캔들의 시간 간격 리스트 (예: ["1m", "5m"]).
             candle_handler_callback (Callable): 새로운 캔들 데이터가 수신될 때마다 호출될 콜백 함수.
                                                 이 함수는 `candle_deques` 딕셔너리를 인자로 받습니다.
             throttle_seconds (Optional[float]): 콜백 함수 호출을 제한하는 시간(초).
@@ -61,10 +62,13 @@ class ZMQClient:
                 "live": 내부 deque를 그대로 전달
                 "deque_copy": deque 컨테이너만 복사 (원소는 공유)
                 "deep_copy": 원소 dict까지 복사
+            exchange (str): 거래소 이름 (예: "upbit"). 토픽/요청에 사용됩니다.
         """
         self.client_id = client_id
         self.symbol = symbol
-        self.intervals = intervals
+        self.intervals = self._validate_intervals(intervals)
+        self.exchange = exchange.lower().strip()
+        self.exchange_prefix = self.exchange.upper()
         self.candle_handler_callback = candle_handler_callback
         self.throttle_seconds = throttle_seconds
         self.zmq_gateway_host = zmq_gateway_host
@@ -88,6 +92,18 @@ class ZMQClient:
         }
         self._validate_callback_snapshot_mode()
         self.threads: List[threading.Thread] = []
+
+    def _validate_intervals(self, intervals: List[str]) -> List[str]:
+        allowed = {"1m", "3m", "5m", "10m", "30m", "1h", "4h", "1d"}
+        validated: List[str] = []
+        for interval in intervals:
+            normalized = interval.strip()
+            if normalized not in allowed:
+                raise ValueError(
+                    "Invalid interval. Expected one of: 1m, 3m, 5m, 10m, 30m, 1h, 4h, 1d."
+                )
+            validated.append(normalized)
+        return validated
 
     def _validate_callback_snapshot_mode(self) -> None:
         valid_modes = {"live", "deque_copy", "deep_copy"}
@@ -165,25 +181,50 @@ class ZMQClient:
             topic_str (str): 이벤트가 발생한 ZMQ 토픽 문자열.
             payload (dict): 이벤트와 관련된 데이터.
         """
-        _, symbol, interval, event_type = topic_str.split(":")
+        parts = topic_str.split(":")
+        if len(parts) < 5:
+            return
 
+        exchange_prefix, channel, symbol, interval, event_type = parts[:5]
+        if exchange_prefix != self.exchange_prefix:
+            return
+        if channel != "CANDLE" or symbol != self.symbol:
+            return
         if interval not in self.candle_deques:
             return
 
         target_deque = self.candle_deques[interval]
 
         with self.storage_lock:
-            if event_type == "UPDATE" and target_deque:
-                target_deque[-1] = payload
-            elif event_type == "CLOSE" and target_deque:
-                target_deque[-1] = payload["closed"]
-                target_deque.append(payload["new"])
+            if event_type == "UPDATE":
+                candle = payload.get("candle")
+                if candle is None:
+                    return
+                if target_deque:
+                    target_deque[-1] = candle
+                else:
+                    target_deque.append(candle)
+            elif event_type == "CLOSE":
+                candle = payload.get("candle")
+                new_candle = payload.get("new")
+                if candle is None or new_candle is None:
+                    return
+                if target_deque:
+                    target_deque[-1] = candle
+                else:
+                    target_deque.append(candle)
+                target_deque.append(new_candle)
             elif event_type == "RECONCILE":
-                reconciled_candle = payload
+                reconciled_candle = payload.get("candle")
+                if reconciled_candle is None:
+                    return
+                reconciled_ts = reconciled_candle.get("ts")
+                if reconciled_ts is None:
+                    return
                 for i in range(len(target_deque) - 1, -1, -1):
-                    if target_deque[i]["timestamp"] == reconciled_candle["timestamp"]:
+                    if target_deque[i].get("ts") == reconciled_ts:
                         logger.info(
-                            f"\n[INFO] [{interval}] 캔들 데이터 보정 발생! T:{reconciled_candle['timestamp']}"
+                            f"\n[INFO] [{interval}] 캔들 데이터 보정 발생! ts:{reconciled_ts}"
                         )
                         target_deque[i] = reconciled_candle
                         break
@@ -196,7 +237,7 @@ class ZMQClient:
         socket_sub.connect(f"tcp://{self.zmq_gateway_host}:{self.zmq_gateway_pub_port}")
 
         for interval in self.intervals:
-            topic = f"CANDLE:{self.symbol}:{interval}:"
+            topic = f"{self.exchange_prefix}:CANDLE:{self.symbol}:{interval}:"
             socket_sub.setsockopt_string(zmq.SUBSCRIBE, topic)
             logger.info(f"[{self.client_id}][SUB] 토픽 구독: '{topic}'")
 
@@ -225,6 +266,7 @@ class ZMQClient:
                     "action": "subscribe_candle",
                     "symbol": self.symbol,
                     "interval": interval,
+                    "exchange": self.exchange,
                 }
                 response = self._send_request(request)
 
@@ -306,6 +348,7 @@ class ZMQClient:
                 "symbol": self.symbol,
                 "interval": interval,
                 "history_count": self.candle_deque_maxlen,
+                "exchange": self.exchange,
             }
             response = self._send_request(req)
 
@@ -340,7 +383,12 @@ class ZMQClient:
         for interval in self.intervals:
             logger.debug(f"[{interval}] 구독 해지 요청 중...")
             self._send_request(
-                {"action": "unsubscribe_candle", "symbol": self.symbol, "interval": interval}
+                {
+                    "action": "unsubscribe_candle",
+                    "symbol": self.symbol,
+                    "interval": interval,
+                    "exchange": self.exchange,
+                }
             )
 
         for t in self.threads:
