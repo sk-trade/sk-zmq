@@ -1,0 +1,99 @@
+{
+  "coverage": {
+    "require_annotations": []
+  },
+  "defaults": {
+    "areas": {
+      "backend": [
+        "backend/**",
+        "server/**",
+        "api/**"
+      ],
+      "frontend": [
+        "frontend/**",
+        "web/**"
+      ],
+      "infra": [
+        ".github/**",
+        "docker/**",
+        "deploy/**",
+        "**/Dockerfile"
+      ],
+      "mobile": [
+        "android/**",
+        "ios/**",
+        "lib/**"
+      ]
+    },
+    "topics": {
+      "auth": [
+        "**/auth/**",
+        "**/*token*",
+        "**/*login*"
+      ],
+      "billing": [
+        "**/billing/**",
+        "**/pricing/**",
+        "**/checkout/**"
+      ],
+      "tests": [
+        "**/tests/**",
+        "**/*test*",
+        "**/*.spec.*"
+      ]
+    }
+  },
+  "indexing": {
+    "exclude": [
+      ".git/**",
+      ".repometa/**",
+      "**/*.png",
+      "**/*.jpg",
+      "**/*.jpeg",
+      "**/*.gif",
+      "**/*.webp",
+      "**/*.zip",
+      "**/*.tar",
+      "**/*.gz"
+    ]
+  },
+  "schema_version": 1,
+  "vocab": {
+    "declared_effects": {
+      "base": [
+        "none",
+        "db",
+        "net",
+        "fs",
+        "ui",
+        "time",
+        "crypto",
+        "config"
+      ],
+      "extend": [
+        "cache",
+        "queue",
+        "email",
+        "sms",
+        "webhook",
+        "push",
+        "third_party"
+      ]
+    },
+    "roles": {
+      "base": [
+        "service",
+        "handler",
+        "adapter",
+        "component",
+        "config",
+        "test",
+        "workflow",
+        "migration",
+        "spec",
+        "script"
+      ],
+      "extend": []
+    }
+  }
+}
