@@ -4,7 +4,8 @@ version = "0.1.2"
 description = "Reusable ZMQ client for candle stream subscriptions"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "pyzmq",
     "orjson",
