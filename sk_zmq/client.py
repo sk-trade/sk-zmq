@@ -385,6 +385,9 @@ class ZMQClient:
         모든 백그라운드 스레드에 종료 신호를 보내고, 게이트웨이에 구독 해지를
         요청한 후, 스레드가 종료될 때까지 대기합니다.
         """
+        if self.stop_event.is_set():
+            return
+
         logger.info("ZMQ 클라이언트 종료 절차 시작...")
         self.stop_event.set()
 

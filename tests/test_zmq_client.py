@@ -527,16 +527,21 @@ class TestStopAndThreadCleanup:
     def test_stop_is_idempotent_for_stop_event(self):
         """Calling stop() a second time must not raise and stop_event stays set.
 
-        The ZMQ context is mocked so context.term() is a no-op on both calls;
-        _send_request is patched so no real socket I/O occurs.  The test
-        verifies that the repeat call completes without exception and that
-        stop_event remains set.
+        Use a real zmq.Context so the first stop can terminate it, then verify
+        second stop does not re-enter network request flow or terminate again.
         """
-        client = _make_client()
-        with patch.object(client, "_send_request", return_value=None):
+        client = ZMQClient(
+            intervals=["1m"],
+            candle_handler_callback=lambda _d: None,
+            **_COMMON_KWARGS,
+        )
+        with patch.object(client, "_send_request", return_value=None) as send_request:
             client.stop()
             client.stop()  # second call — must not raise
+            assert client.context.closed
         assert client.stop_event.is_set()
+        assert client.context.closed
+        assert send_request.call_count == 1
 
     def test_stop_without_started_threads(self):
         """stop() with no threads in client.threads must not raise."""
