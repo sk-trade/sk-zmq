@@ -11,5 +11,11 @@ dependencies = [
     "orjson",
 ]
 
+[dependency-groups]
+dev = [
+    "build",
+    "pytest",
+]
+
 [tool.setuptools]
 packages = ["sk_zmq"]

@@ -193,7 +193,11 @@ class ZMQClient:
         if interval not in self.candle_deques:
             return
 
+        if event_type not in {"UPDATE", "CLOSE", "RECONCILE"}:
+            return
+
         target_deque = self.candle_deques[interval]
+        updated = False
 
         with self.storage_lock:
             if event_type == "UPDATE":
@@ -204,6 +208,7 @@ class ZMQClient:
                     target_deque[-1] = candle
                 else:
                     target_deque.append(candle)
+                updated = True
             elif event_type == "CLOSE":
                 candle = payload.get("candle")
                 new_candle = payload.get("new")
@@ -214,6 +219,7 @@ class ZMQClient:
                 else:
                     target_deque.append(candle)
                 target_deque.append(new_candle)
+                updated = True
             elif event_type == "RECONCILE":
                 reconciled_candle = payload.get("candle")
                 if reconciled_candle is None:
@@ -227,9 +233,11 @@ class ZMQClient:
                             f"\n[INFO] [{interval}] 캔들 데이터 보정 발생! ts:{reconciled_ts}"
                         )
                         target_deque[i] = reconciled_candle
+                        updated = True
                         break
 
-        self.data_updated_event.set()
+        if updated:
+            self.data_updated_event.set()
 
     def _data_listener_thread(self):
         """[스레드 타겟] ZMQ SUB 소켓을 통해 실시간 캔들 데이터를 구독하고 수신합니다."""

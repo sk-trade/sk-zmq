@@ -398,6 +398,13 @@ class TestHandleCandleEventReconcile:
         # All ts values should be unchanged
         assert all(c.candle_deques["1m"][i]["ts"] == i for i in range(3))
 
+    def test_reconcile_no_match_does_not_set_data_updated_event(self):
+        c = _make_client(intervals=["1m"])
+        c.candle_deques["1m"].append(_make_candle(1))
+        c.data_updated_event.clear()
+        _inject_reconcile(c, "1m", _make_candle(99, close=1.0))
+        assert not c.data_updated_event.is_set()
+
     def test_reconcile_missing_candle_key_ignored(self):
         c = _make_client(intervals=["1m"])
         c.data_updated_event.clear()
@@ -430,6 +437,15 @@ class TestHandleCandleEventReconcile:
         values = [d["close"] for d in c.candle_deques["1m"]]
         # Only the last occurrence (index 1) should be patched
         assert values == [10.0, 99.0]
+
+    def test_unknown_event_type_is_ignored(self):
+        c = _make_client(intervals=["1m"])
+        c.candle_deques["1m"].append(_make_candle(1, close=10.0))
+        c.data_updated_event.clear()
+        topic = "UPBIT:CANDLE:KRW-BTC:1m:SNAPSHOT"
+        c._handle_candle_event(topic, {"candle": _make_candle(1, close=99.0)})
+        assert c.candle_deques["1m"][-1]["close"] == 10.0
+        assert not c.data_updated_event.is_set()
 
 
 # ===========================================================================

@@ -8,7 +8,14 @@ It does not include any trading logic.
 ## Install
 
 ```bash
-pip install -e /home/sanghun/workspace/sk/sk-zmq
+pip install -e .
+```
+
+For development checks:
+
+```bash
+uv run --group dev pytest -q
+uv build
 ```
 
 ## Usage
@@ -53,7 +60,9 @@ client.start()
 Set `exchange` to select the topic prefix (e.g., `UPBIT`). Other exchanges are supported by changing this value.
 
 The gateway now publishes candle events with an envelope that includes `candle` (and `new` for CLOSE).
-Reconcile events replace candles by matching `ts`.
+Reconcile events replace candles by matching `ts`. If no existing candle has the
+matching `ts`, the event is ignored and the user callback is not triggered.
+Unknown event types are ignored.
 
 
 The callback now runs outside the internal storage lock.
