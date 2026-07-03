@@ -195,6 +195,8 @@ class ZMQClient:
 
         if event_type not in {"UPDATE", "CLOSE", "RECONCILE"}:
             return
+        if not isinstance(payload, dict):
+            return
 
         target_deque = self.candle_deques[interval]
         updated = False

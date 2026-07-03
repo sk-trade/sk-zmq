@@ -287,6 +287,14 @@ class TestHandleCandleEventFiltering:
         updated = self._event_sets_updated(c, topic, {"candle": _make_candle(1)})
         assert not updated
 
+    @pytest.mark.parametrize("payload", [None, [], "not-a-dict"])
+    def test_non_dict_payload_ignored(self, payload):
+        c = self._client()
+        topic = "UPBIT:CANDLE:KRW-BTC:1m:UPDATE"
+        updated = self._event_sets_updated(c, topic, payload)
+        assert not updated
+        assert len(c.candle_deques["1m"]) == 0
+
     def test_exchange_case_insensitive_init(self):
         """exchange param is lowered; prefix becomes uppercase for filtering."""
         c = _make_client(intervals=["1m"], exchange="UPBIT")
