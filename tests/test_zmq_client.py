@@ -337,6 +337,17 @@ class TestHandleCandleEventUpdate:
         assert not c.data_updated_event.is_set()
         assert len(c.candle_deques["1m"]) == 0
 
+    def test_update_non_dict_candle_ignored(self):
+        c = _make_client(intervals=["1m"])
+        existing = _make_candle(1, close=50.0)
+        c.candle_deques["1m"].append(existing)
+        c.data_updated_event.clear()
+        topic = "UPBIT:CANDLE:KRW-BTC:1m:UPDATE"
+        c._handle_candle_event(topic, {"candle": []})
+        assert not c.data_updated_event.is_set()
+        assert len(c.candle_deques["1m"]) == 1
+        assert c.candle_deques["1m"][-1] == existing
+
     def test_update_only_affects_target_interval(self):
         c = _make_client(intervals=["1m", "5m"])
         _inject_update(c, "1m", _make_candle(1))
@@ -379,6 +390,24 @@ class TestHandleCandleEventClose:
         c._handle_candle_event(topic, {"candle": _make_candle(1)})  # no 'new'
         assert not c.data_updated_event.is_set()
 
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"candle": [], "new": _make_candle(2)},
+            {"candle": _make_candle(1), "new": []},
+            {"candle": [], "new": []},
+        ],
+    )
+    def test_close_non_dict_candle_or_new_ignored(self, payload):
+        c = _make_client(intervals=["1m"])
+        existing = _make_candle(1, close=50.0)
+        c.candle_deques["1m"].append(existing)
+        c.data_updated_event.clear()
+        topic = "UPBIT:CANDLE:KRW-BTC:1m:CLOSE"
+        c._handle_candle_event(topic, payload)
+        assert not c.data_updated_event.is_set()
+        assert list(c.candle_deques["1m"]) == [existing]
+
     def test_close_sets_data_updated_event(self):
         c = _make_client(intervals=["1m"])
         c.data_updated_event.clear()
@@ -419,6 +448,16 @@ class TestHandleCandleEventReconcile:
         topic = "UPBIT:CANDLE:KRW-BTC:1m:RECONCILE"
         c._handle_candle_event(topic, {})
         assert not c.data_updated_event.is_set()
+
+    def test_reconcile_non_dict_candle_ignored(self):
+        c = _make_client(intervals=["1m"])
+        existing = _make_candle(1, close=50.0)
+        c.candle_deques["1m"].append(existing)
+        c.data_updated_event.clear()
+        topic = "UPBIT:CANDLE:KRW-BTC:1m:RECONCILE"
+        c._handle_candle_event(topic, {"candle": []})
+        assert not c.data_updated_event.is_set()
+        assert list(c.candle_deques["1m"]) == [existing]
 
     def test_reconcile_missing_ts_key_ignored(self):
         c = _make_client(intervals=["1m"])

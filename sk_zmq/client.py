@@ -204,7 +204,7 @@ class ZMQClient:
         with self.storage_lock:
             if event_type == "UPDATE":
                 candle = payload.get("candle")
-                if candle is None:
+                if not isinstance(candle, dict):
                     return
                 if target_deque:
                     target_deque[-1] = candle
@@ -214,7 +214,7 @@ class ZMQClient:
             elif event_type == "CLOSE":
                 candle = payload.get("candle")
                 new_candle = payload.get("new")
-                if candle is None or new_candle is None:
+                if not isinstance(candle, dict) or not isinstance(new_candle, dict):
                     return
                 if target_deque:
                     target_deque[-1] = candle
@@ -224,7 +224,7 @@ class ZMQClient:
                 updated = True
             elif event_type == "RECONCILE":
                 reconciled_candle = payload.get("candle")
-                if reconciled_candle is None:
+                if not isinstance(reconciled_candle, dict):
                     return
                 reconciled_ts = reconciled_candle.get("ts")
                 if reconciled_ts is None:
