@@ -254,9 +254,15 @@ class ZMQClient:
         while not self.stop_event.is_set():
             try:
                 topic_bytes, payload_bytes = socket_sub.recv_multipart(flags=zmq.NOBLOCK)
-                self._handle_candle_event(topic_bytes.decode(), orjson.loads(payload_bytes))
+                topic_str = topic_bytes.decode()
+                payload = orjson.loads(payload_bytes)
             except zmq.Again:
                 time.sleep(0.01)
+                continue
+            except (orjson.JSONDecodeError, UnicodeDecodeError, TypeError) as e:
+                logger.warning(f"잘못된 캔들 이벤트 페이로드를 무시합니다: {e}")
+                continue
+            self._handle_candle_event(topic_str, payload)
         socket_sub.close()
         logger.debug(f"\n[{self.client_id}][SUB] 데이터 리스너 종료.")
 
