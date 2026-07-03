@@ -636,3 +636,99 @@ class TestStrategyTriggerThread:
 
         client.stop_event.set()
         trigger.join(timeout=2)
+
+
+# ===========================================================================
+# 11. Start + renewal lifecycle
+# ===========================================================================
+
+
+class _FiniteWait:
+    def __init__(self, cycles: int):
+        self.cycles = cycles
+        self.calls = 0
+
+    def __call__(self, timeout=None) -> bool:
+        self.calls += 1
+        return self.calls > self.cycles
+
+
+class TestLifecycleStartAndRenewal:
+    """Lifecycle tests around start() and subscription renewal behavior."""
+
+    def test_start_sends_initial_snapshot_requests_for_all_intervals(self):
+        client = _make_client(intervals=["1m", "5m"], candle_deque_maxlen=4)
+        responses = [
+            {"status": "ok", "data": [_make_candle(1)]},
+            {"status": "ok", "data": [_make_candle(2)]},
+        ]
+
+        with patch.object(client, "_send_request", side_effect=responses) as send_request, \
+            patch.object(client, "_data_listener_thread", return_value=None), \
+            patch.object(client, "_strategy_trigger_thread", return_value=None), \
+            patch.object(client, "_subscription_renewer_thread", return_value=None):
+            assert client.start() is True
+
+        for t in client.threads:
+            t.join(timeout=1)
+
+        assert [call.args[0] for call in send_request.call_args_list] == [
+            {
+                "action": "subscribe_candle",
+                "symbol": "KRW-BTC",
+                "interval": "1m",
+                "history_count": 4,
+                "exchange": "upbit",
+            },
+            {
+                "action": "subscribe_candle",
+                "symbol": "KRW-BTC",
+                "interval": "5m",
+                "history_count": 4,
+                "exchange": "upbit",
+            },
+        ]
+        assert len(client.threads) == 3
+
+    @pytest.mark.parametrize(
+        "snapshot_response",
+        [
+            None,
+            {"status": "ok", "data": []},
+            {"status": "error", "data": [_make_candle(1)]},
+        ],
+    )
+    def test_start_returns_false_and_starts_no_threads_when_snapshot_fails_or_empty(self, snapshot_response):
+        client = _make_client(intervals=["1m"])
+        with patch.object(client, "_send_request", return_value=snapshot_response) as send_request:
+            assert client.start() is False
+        assert send_request.call_count == 1
+        assert client.threads == []
+
+    def test_renewer_failures_increase_and_trigger_critical_callback(self):
+        critical_calls = []
+        client = _make_client(intervals=["1m"], on_critical=critical_calls.append)
+
+        with patch.object(client, "_send_request", return_value={"status": "error"}), \
+            patch.object(type(client.stop_event), "wait", _FiniteWait(client.MAX_CONSECUTIVE_FAILURES)):
+            client._subscription_renewer_thread()
+
+        assert client.consecutive_renewal_failures == client.MAX_CONSECUTIVE_FAILURES
+        assert len(critical_calls) == 1
+
+    def test_successful_renewal_after_failures_resets_counter(self):
+        responses = iter([
+            {"status": "error"},
+            {"status": "error"},
+            {"status": "ok"},
+        ])
+        client = _make_client(intervals=["1m"])
+
+        def pop_response(*_args, **_kwargs):
+            return next(responses)
+
+        with patch.object(client, "_send_request", side_effect=pop_response), \
+            patch.object(type(client.stop_event), "wait", _FiniteWait(3)):
+            client._subscription_renewer_thread()
+
+        assert client.consecutive_renewal_failures == 0
