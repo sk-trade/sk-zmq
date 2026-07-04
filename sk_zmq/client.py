@@ -253,7 +253,11 @@ class ZMQClient:
 
         while not self.stop_event.is_set():
             try:
-                topic_bytes, payload_bytes = socket_sub.recv_multipart(flags=zmq.NOBLOCK)
+                frames = socket_sub.recv_multipart(flags=zmq.NOBLOCK)
+                if not isinstance(frames, (list, tuple)) or len(frames) != 2:
+                    logger.warning(f"잘못된 캔들 이벤트 프레임을 무시합니다: {frames!r}")
+                    continue
+                topic_bytes, payload_bytes = frames
                 topic_str = topic_bytes.decode()
                 payload = orjson.loads(payload_bytes)
             except zmq.Again:

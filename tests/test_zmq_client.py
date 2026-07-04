@@ -623,10 +623,48 @@ class _InvalidJsonThenStopSocket:
         self.closed = True
 
 
+class _MalformedMultipartThenStopSocket:
+    def __init__(self, client: ZMQClient, frames):
+        self.client = client
+        self.frames = frames
+        self.closed = False
+
+    def connect(self, _endpoint):
+        pass
+
+    def setsockopt_string(self, _option, _value):
+        pass
+
+    def recv_multipart(self, flags=0):
+        self.client.stop_event.set()
+        return self.frames
+
+    def close(self):
+        self.closed = True
+
+
 class TestDataListenerMalformedPayloads:
     def test_invalid_json_payload_is_ignored_without_crashing_listener(self):
         client = _make_client(intervals=["1m"])
         socket = _InvalidJsonThenStopSocket(client)
+        client.context.socket.return_value = socket
+
+        client._data_listener_thread()
+
+        assert socket.closed
+        assert len(client.candle_deques["1m"]) == 0
+        assert not client.data_updated_event.is_set()
+
+    @pytest.mark.parametrize(
+        "frames",
+        [
+            [b"UPBIT:CANDLE:KRW-BTC:1m:UPDATE"],
+            [b"UPBIT:CANDLE:KRW-BTC:1m:UPDATE", b'{"candle": {"ts": 1}}', b"extra"],
+        ],
+    )
+    def test_malformed_multipart_payload_is_ignored_without_crashing_listener(self, frames):
+        client = _make_client(intervals=["1m"])
+        socket = _MalformedMultipartThenStopSocket(client, frames)
         client.context.socket.return_value = socket
 
         client._data_listener_thread()
