@@ -281,6 +281,13 @@ class TestHandleCandleEventFiltering:
         updated = self._event_sets_updated(c, "UPBIT:CANDLE:KRW-BTC", {"candle": _make_candle(1)})
         assert not updated
 
+    def test_extra_topic_segments_ignored(self):
+        c = self._client()
+        topic = "UPBIT:CANDLE:KRW-BTC:1m:UPDATE:EXTRA"
+        updated = self._event_sets_updated(c, topic, {"candle": _make_candle(1)})
+        assert not updated
+        assert len(c.candle_deques["1m"]) == 0
+
     def test_wrong_channel_ignored(self):
         c = self._client()
         topic = "UPBIT:TICKER:KRW-BTC:1m:UPDATE"

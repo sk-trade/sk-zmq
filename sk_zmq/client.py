@@ -182,7 +182,7 @@ class ZMQClient:
             payload (dict): 이벤트와 관련된 데이터.
         """
         parts = topic_str.split(":")
-        if len(parts) < 5:
+        if len(parts) != 5:
             return
 
         exchange_prefix, channel, symbol, interval, event_type = parts[:5]
