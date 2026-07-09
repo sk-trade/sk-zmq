@@ -336,6 +336,15 @@ class TestHandleCandleEventUpdate:
         _inject_update(c, "1m", _make_candle(1))
         assert c.data_updated_event.is_set()
 
+    def test_update_identical_candle_does_not_set_data_updated_event(self):
+        c = _make_client(intervals=["1m"])
+        candle = _make_candle(1, close=100.0)
+        c.candle_deques["1m"].append(dict(candle))
+        c.data_updated_event.clear()
+        _inject_update(c, "1m", dict(candle))
+        assert not c.data_updated_event.is_set()
+        assert list(c.candle_deques["1m"]) == [candle]
+
     def test_update_missing_candle_key_ignored(self):
         c = _make_client(intervals=["1m"])
         c.data_updated_event.clear()

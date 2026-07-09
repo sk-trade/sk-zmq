@@ -212,6 +212,8 @@ class ZMQClient:
                 if not isinstance(candle, dict):
                     return
                 if target_deque:
+                    if target_deque[-1] == candle:
+                        return
                     target_deque[-1] = candle
                 else:
                     target_deque.append(candle)
