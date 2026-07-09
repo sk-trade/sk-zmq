@@ -236,6 +236,8 @@ class ZMQClient:
                     return
                 for i in range(len(target_deque) - 1, -1, -1):
                     if target_deque[i].get("ts") == reconciled_ts:
+                        if target_deque[i] == reconciled_candle:
+                            break
                         logger.info(
                             f"\n[INFO] [{interval}] 캔들 데이터 보정 발생! ts:{reconciled_ts}"
                         )
