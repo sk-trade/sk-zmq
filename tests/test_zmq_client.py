@@ -26,8 +26,8 @@ _COMMON_KWARGS = dict(
     client_id="test-client",
     symbol="KRW-BTC",
     zmq_gateway_host="127.0.0.1",
-    zmq_gateway_req_port=5555,
-    zmq_gateway_pub_port=5556,
+    zmq_gateway_req_port=11556,
+    zmq_gateway_pub_port=11558,
 )
 
 
@@ -856,3 +856,46 @@ class TestLifecycleStartAndRenewal:
             client._subscription_renewer_thread()
 
         assert client.consecutive_renewal_failures == 0
+
+    def test_renewal_sends_history_count_1(self):
+        """Renewal thread must send history_count=1 (TTL extend only)."""
+        client = _make_client(intervals=["1m", "5m"])
+
+        renew_responses = [
+            {"status": "ok", "data": [_make_candle(1)]},
+            {"status": "ok", "data": [_make_candle(2)]},
+            {"status": "ok", "data": [_make_candle(1)]},
+            {"status": "ok", "data": [_make_candle(2)]},
+            {"status": "ok", "data": [_make_candle(1)]},
+            {"status": "ok", "data": [_make_candle(2)]},
+        ]
+
+        with patch.object(client, "_send_request", side_effect=renew_responses) as send_request, \
+             patch.object(type(client.stop_event), "wait", _FiniteWait(3)):
+            client._subscription_renewer_thread()
+
+        assert send_request.call_count == 6
+        for call in send_request.call_args_list:
+            req = call.args[0]
+            assert req["action"] == "subscribe_candle"
+            assert req["history_count"] == 1
+
+    def test_stop_sends_unsubscribe_for_each_interval(self):
+        """stop() must send unsubscribe_candle for each subscribed interval."""
+        client = _make_client(intervals=["1m", "5m"])
+
+        with patch.object(client, "_send_request", return_value=None) as send_request:
+            client.stop()
+
+        assert send_request.call_count == 2
+        expected_actions = {"unsubscribe_candle", "unsubscribe_candle"}
+        actual_actions = {call.args[0]["action"] for call in send_request.call_args_list}
+        assert actual_actions == expected_actions
+
+        unsubscribe_calls = [call.args[0] for call in send_request.call_args_list]
+        intervals_sent = {c["interval"] for c in unsubscribe_calls}
+        assert intervals_sent == {"1m", "5m"}
+
+        for call in unsubscribe_calls:
+            assert call["symbol"] == "KRW-BTC"
+            assert call["exchange"] == "upbit"

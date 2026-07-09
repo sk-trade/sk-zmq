@@ -31,9 +31,9 @@ class ZMQClient:
         candle_handler_callback: Callable[[Dict[str, deque]], None],
         throttle_seconds: Optional[float] = 0.1,
         *,
-        zmq_gateway_host: str,
-        zmq_gateway_req_port: int,
-        zmq_gateway_pub_port: int,
+        zmq_gateway_host: str = "localhost",
+        zmq_gateway_req_port: int = 11556,
+        zmq_gateway_pub_port: int = 11558,
         server_candle_ttl: int = 300,
         candle_deque_maxlen: int = 200,
         on_critical: Optional[Callable[[str], None]] = None,
@@ -286,6 +286,7 @@ class ZMQClient:
                     "action": "subscribe_candle",
                     "symbol": self.symbol,
                     "interval": interval,
+                    "history_count": 1,
                     "exchange": self.exchange,
                 }
                 response = self._send_request(request)
