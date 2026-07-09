@@ -650,6 +650,26 @@ class _MalformedMultipartThenStopSocket:
         self.closed = True
 
 
+class _NonDictResponseSocket:
+    def __init__(self):
+        self.closed = False
+
+    def setsockopt(self, _option, _value):
+        pass
+
+    def connect(self, _endpoint):
+        pass
+
+    def send(self, _payload):
+        pass
+
+    def recv(self):
+        return b'["bad"]'
+
+    def close(self):
+        self.closed = True
+
+
 class TestDataListenerMalformedPayloads:
     def test_invalid_json_payload_is_ignored_without_crashing_listener(self):
         client = _make_client(intervals=["1m"])
@@ -828,6 +848,31 @@ class TestLifecycleStartAndRenewal:
             assert client.start() is False
         assert send_request.call_count == 1
         assert client.threads == []
+
+    @pytest.mark.parametrize("snapshot_response", [["bad"], "bad", 1])
+    def test_start_returns_false_and_starts_no_threads_when_snapshot_response_is_not_dict(self, snapshot_response):
+        client = _make_client(intervals=["1m"])
+        with patch.object(client, "_send_request", return_value=snapshot_response) as send_request:
+            assert client.start() is False
+        assert send_request.call_count == 1
+        assert client.threads == []
+
+    def test_send_request_rejects_decoded_non_dict_response(self):
+        client = _make_client(intervals=["1m"])
+        socket = _NonDictResponseSocket()
+        client.context.socket.return_value = socket
+
+        assert client._send_request({"action": "subscribe_candle"}, max_retries=1) is None
+        assert socket.closed
+
+    def test_renewer_counts_truthy_non_dict_response_as_failure(self):
+        client = _make_client(intervals=["1m"])
+
+        with patch.object(client, "_send_request", return_value=["bad"]), \
+            patch.object(type(client.stop_event), "wait", _FiniteWait(1)):
+            client._subscription_renewer_thread()
+
+        assert client.consecutive_renewal_failures == 1
 
     def test_renewer_failures_increase_and_trigger_critical_callback(self):
         critical_calls = []

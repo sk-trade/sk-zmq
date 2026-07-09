@@ -146,6 +146,11 @@ class ZMQClient:
             try:
                 socket_req.send(orjson.dumps(request))
                 response = orjson.loads(socket_req.recv())
+                if not isinstance(response, dict):
+                    raise ValueError(
+                        "ZMQ gateway response must be a JSON object, "
+                        f"got {type(response).__name__}."
+                    )
                 return response
             except zmq.Again:
                 logger.warning(
@@ -291,7 +296,7 @@ class ZMQClient:
                 }
                 response = self._send_request(request)
 
-                if not (response and response.get("status") == "ok"):
+                if not (isinstance(response, dict) and response.get("status") == "ok"):
                     all_renewals_succeeded = False
                     logger.error(f"❌ [{interval}] 구독 갱신에 최종 실패했습니다! 응답: {response}")
 
@@ -373,7 +378,11 @@ class ZMQClient:
             }
             response = self._send_request(req)
 
-            if response and response.get("status") == "ok" and response.get("data"):
+            if (
+                isinstance(response, dict)
+                and response.get("status") == "ok"
+                and response.get("data")
+            ):
                 with self.storage_lock:
                     self.candle_deques[interval].extend(response["data"])
                 logger.info(f"✅ [{interval}] 스냅샷 수신 성공 ({len(response['data'])}개).")
