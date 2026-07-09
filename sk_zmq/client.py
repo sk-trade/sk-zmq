@@ -31,9 +31,9 @@ class ZMQClient:
         candle_handler_callback: Callable[[Dict[str, deque]], None],
         throttle_seconds: Optional[float] = 0.1,
         *,
-        zmq_gateway_host: str,
-        zmq_gateway_req_port: int,
-        zmq_gateway_pub_port: int,
+        zmq_gateway_host: str = "localhost",
+        zmq_gateway_req_port: int = 11556,
+        zmq_gateway_pub_port: int = 11558,
         server_candle_ttl: int = 300,
         candle_deque_maxlen: int = 200,
         on_critical: Optional[Callable[[str], None]] = None,
@@ -182,7 +182,7 @@ class ZMQClient:
             payload (dict): 이벤트와 관련된 데이터.
         """
         parts = topic_str.split(":")
-        if len(parts) < 5:
+        if len(parts) != 5:
             return
 
         exchange_prefix, channel, symbol, interval, event_type = parts[:5]
@@ -193,30 +193,38 @@ class ZMQClient:
         if interval not in self.candle_deques:
             return
 
+        if event_type not in {"UPDATE", "CLOSE", "RECONCILE"}:
+            return
+        if not isinstance(payload, dict):
+            return
+
         target_deque = self.candle_deques[interval]
+        updated = False
 
         with self.storage_lock:
             if event_type == "UPDATE":
                 candle = payload.get("candle")
-                if candle is None:
+                if not isinstance(candle, dict):
                     return
                 if target_deque:
                     target_deque[-1] = candle
                 else:
                     target_deque.append(candle)
+                updated = True
             elif event_type == "CLOSE":
                 candle = payload.get("candle")
                 new_candle = payload.get("new")
-                if candle is None or new_candle is None:
+                if not isinstance(candle, dict) or not isinstance(new_candle, dict):
                     return
                 if target_deque:
                     target_deque[-1] = candle
                 else:
                     target_deque.append(candle)
                 target_deque.append(new_candle)
+                updated = True
             elif event_type == "RECONCILE":
                 reconciled_candle = payload.get("candle")
-                if reconciled_candle is None:
+                if not isinstance(reconciled_candle, dict):
                     return
                 reconciled_ts = reconciled_candle.get("ts")
                 if reconciled_ts is None:
@@ -227,9 +235,11 @@ class ZMQClient:
                             f"\n[INFO] [{interval}] 캔들 데이터 보정 발생! ts:{reconciled_ts}"
                         )
                         target_deque[i] = reconciled_candle
+                        updated = True
                         break
 
-        self.data_updated_event.set()
+        if updated:
+            self.data_updated_event.set()
 
     def _data_listener_thread(self):
         """[스레드 타겟] ZMQ SUB 소켓을 통해 실시간 캔들 데이터를 구독하고 수신합니다."""
@@ -243,10 +253,20 @@ class ZMQClient:
 
         while not self.stop_event.is_set():
             try:
-                topic_bytes, payload_bytes = socket_sub.recv_multipart(flags=zmq.NOBLOCK)
-                self._handle_candle_event(topic_bytes.decode(), orjson.loads(payload_bytes))
+                frames = socket_sub.recv_multipart(flags=zmq.NOBLOCK)
+                if not isinstance(frames, (list, tuple)) or len(frames) != 2:
+                    logger.warning(f"잘못된 캔들 이벤트 프레임을 무시합니다: {frames!r}")
+                    continue
+                topic_bytes, payload_bytes = frames
+                topic_str = topic_bytes.decode()
+                payload = orjson.loads(payload_bytes)
             except zmq.Again:
                 time.sleep(0.01)
+                continue
+            except (orjson.JSONDecodeError, UnicodeDecodeError, TypeError) as e:
+                logger.warning(f"잘못된 캔들 이벤트 페이로드를 무시합니다: {e}")
+                continue
+            self._handle_candle_event(topic_str, payload)
         socket_sub.close()
         logger.debug(f"\n[{self.client_id}][SUB] 데이터 리스너 종료.")
 
@@ -266,6 +286,7 @@ class ZMQClient:
                     "action": "subscribe_candle",
                     "symbol": self.symbol,
                     "interval": interval,
+                    "history_count": 1,
                     "exchange": self.exchange,
                 }
                 response = self._send_request(request)
@@ -377,6 +398,9 @@ class ZMQClient:
         모든 백그라운드 스레드에 종료 신호를 보내고, 게이트웨이에 구독 해지를
         요청한 후, 스레드가 종료될 때까지 대기합니다.
         """
+        if self.stop_event.is_set():
+            return
+
         logger.info("ZMQ 클라이언트 종료 절차 시작...")
         self.stop_event.set()
 

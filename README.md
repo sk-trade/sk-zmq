@@ -8,7 +8,14 @@ It does not include any trading logic.
 ## Install
 
 ```bash
-pip install -e /home/sanghun/workspace/sk/sk-zmq
+pip install -e .
+```
+
+For development checks:
+
+```bash
+uv run --group dev pytest -q
+uv build
 ```
 
 ## Usage
@@ -34,8 +41,8 @@ client = ZMQClient(
     candle_handler_callback=on_candle_update,
     throttle_seconds=0.1,
     zmq_gateway_host="127.0.0.1",
-    zmq_gateway_req_port=5555,
-    zmq_gateway_pub_port=5556,
+    zmq_gateway_req_port=11556,
+    zmq_gateway_pub_port=11558,
     server_candle_ttl=300,
     candle_deque_maxlen=200,
     on_critical=on_critical,
@@ -46,15 +53,24 @@ client = ZMQClient(
 client.start()
 ```
 
-## Callback snapshot modes
-
 ## Exchange and payload expectations
 
-Set `exchange` to select the topic prefix (e.g., `UPBIT`). Other exchanges are supported by changing this value.
+`exchange` selects the candle topic prefix used by the client.
 
-The gateway now publishes candle events with an envelope that includes `candle` (and `new` for CLOSE).
-Reconcile events replace candles by matching `ts`.
+For example, `exchange="upbit"` subscribes to:
 
+`UPBIT:CANDLE:{symbol}:{interval}:`
+
+The gateway must actually publish candle topics with the same exchange prefix.
+The current crypto-stream-broadcaster gateway publishes UPBIT candle topics by default.
+Changing `exchange` alone does not enable another exchange unless the gateway also publishes that exchange prefix.
+
+The gateway publishes candle events with an envelope that includes `candle` (and `new` for CLOSE).
+Reconcile events replace candles by matching `ts`. If no existing candle has the
+matching `ts`, the event is ignored and the user callback is not triggered.
+Unknown event types are ignored.
+
+## Callback snapshot modes
 
 The callback now runs outside the internal storage lock.
 Depending on your needs, choose how data is passed into the callback:
@@ -74,8 +90,8 @@ client = ZMQClient(
     candle_handler_callback=on_candle_update,
     throttle_seconds=0.1,
     zmq_gateway_host="127.0.0.1",
-    zmq_gateway_req_port=5555,
-    zmq_gateway_pub_port=5556,
+    zmq_gateway_req_port=11556,
+    zmq_gateway_pub_port=11558,
     server_candle_ttl=300,
     candle_deque_maxlen=200,
     on_critical=on_critical,
