@@ -875,6 +875,32 @@ class TestLifecycleStartAndRenewal:
         assert send_request.call_count == 1
         assert client.threads == []
 
+    def test_start_failure_leaves_no_partial_snapshot_before_retry(self):
+        client = _make_client(intervals=["1m", "5m"])
+        first_snapshot = _make_candle(1)
+        responses = [
+            {"status": "ok", "data": [first_snapshot]},
+            {"status": "error", "data": []},
+            {"status": "ok", "data": [first_snapshot]},
+            {"status": "ok", "data": [_make_candle(2)]},
+        ]
+
+        with patch.object(client, "_send_request", side_effect=responses), \
+            patch.object(client, "_data_listener_thread", return_value=None), \
+            patch.object(client, "_strategy_trigger_thread", return_value=None), \
+            patch.object(client, "_subscription_renewer_thread", return_value=None):
+            assert client.start() is False
+            assert list(client.candle_deques["1m"]) == []
+            assert list(client.candle_deques["5m"]) == []
+
+            assert client.start() is True
+
+        for thread in client.threads:
+            thread.join(timeout=1)
+
+        assert list(client.candle_deques["1m"]) == [first_snapshot]
+        assert list(client.candle_deques["5m"]) == [_make_candle(2)]
+
     def test_send_request_rejects_decoded_non_dict_response(self):
         client = _make_client(intervals=["1m"])
         socket = _NonDictResponseSocket()

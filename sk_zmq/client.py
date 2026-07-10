@@ -372,6 +372,7 @@ class ZMQClient:
         """
         logger.info("ZMQ 게이트웨이에 연결 및 스냅샷 요청을 시작합니다...")
 
+        initial_snapshots: Dict[str, list] = {}
         for interval in self.intervals:
             req = {
                 "action": "subscribe_candle",
@@ -387,12 +388,16 @@ class ZMQClient:
                 and response.get("status") == "ok"
                 and response.get("data")
             ):
-                with self.storage_lock:
-                    self.candle_deques[interval].extend(response["data"])
+                initial_snapshots[interval] = response["data"]
                 logger.info(f"✅ [{interval}] 스냅샷 수신 성공 ({len(response['data'])}개).")
             else:
                 logger.error(f"❌ [{interval}] 스냅샷 수신 실패. 클라이언트를 시작할 수 없습니다.")
                 return False
+
+        # Do not leave a partial initial state behind when a later request fails.
+        with self.storage_lock:
+            for interval, snapshot in initial_snapshots.items():
+                self.candle_deques[interval].extend(snapshot)
 
         listener = threading.Thread(target=self._data_listener_thread, name="ZMQListener")
         renewer = threading.Thread(target=self._subscription_renewer_thread, name="SubscriptionRenewer")
