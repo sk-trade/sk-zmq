@@ -386,7 +386,9 @@ class ZMQClient:
             if (
                 isinstance(response, dict)
                 and response.get("status") == "ok"
-                and response.get("data")
+                and isinstance(response.get("data"), list)
+                and response["data"]
+                and all(isinstance(candle, dict) for candle in response["data"])
             ):
                 initial_snapshots[interval] = response["data"]
                 logger.info(f"✅ [{interval}] 스냅샷 수신 성공 ({len(response['data'])}개).")

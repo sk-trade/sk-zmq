@@ -875,6 +875,18 @@ class TestLifecycleStartAndRenewal:
         assert send_request.call_count == 1
         assert client.threads == []
 
+    @pytest.mark.parametrize("snapshot_data", ["bad", {"ts": 1}, ["bad"], [None]])
+    def test_start_rejects_malformed_snapshot_data(self, snapshot_data):
+        client = _make_client(intervals=["1m"])
+        response = {"status": "ok", "data": snapshot_data}
+
+        with patch.object(client, "_send_request", return_value=response) as send_request:
+            assert client.start() is False
+
+        assert send_request.call_count == 1
+        assert client.threads == []
+        assert list(client.candle_deques["1m"]) == []
+
     def test_start_failure_leaves_no_partial_snapshot_before_retry(self):
         client = _make_client(intervals=["1m", "5m"])
         first_snapshot = _make_candle(1)
