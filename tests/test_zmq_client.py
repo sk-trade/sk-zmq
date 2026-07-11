@@ -642,6 +642,15 @@ class TestStopAndThreadCleanup:
             client.stop()
         assert client.stop_event.is_set()
 
+    def test_stop_completes_cleanup_when_unsubscribe_raises(self):
+        client = _make_client(intervals=["1m"])
+
+        with patch.object(client, "_send_request", side_effect=RuntimeError("failed")):
+            client.stop()
+
+        assert client.stop_event.is_set()
+        client.context.term.assert_called_once_with()
+
 
 def _noop_listener(client: ZMQClient) -> None:
     """A stand-in for _data_listener_thread that just waits for stop_event."""

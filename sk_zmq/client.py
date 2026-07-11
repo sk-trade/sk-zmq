@@ -425,14 +425,17 @@ class ZMQClient:
 
         for interval in self.intervals:
             logger.debug(f"[{interval}] 구독 해지 요청 중...")
-            self._send_request(
-                {
-                    "action": "unsubscribe_candle",
-                    "symbol": self.symbol,
-                    "interval": interval,
-                    "exchange": self.exchange,
-                }
-            )
+            try:
+                self._send_request(
+                    {
+                        "action": "unsubscribe_candle",
+                        "symbol": self.symbol,
+                        "interval": interval,
+                        "exchange": self.exchange,
+                    }
+                )
+            except Exception as e:
+                logger.error(f"[{interval}] 구독 해지 요청 중 오류 발생: {e}")
 
         for t in self.threads:
             if t.is_alive():
