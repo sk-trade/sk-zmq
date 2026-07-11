@@ -431,6 +431,16 @@ class TestHandleCandleEventClose:
         _inject_close(c, "1m", _make_candle(1), _make_candle(2))
         assert c.data_updated_event.is_set()
 
+    def test_close_does_not_set_event_when_bounded_storage_is_unchanged(self):
+        c = _make_client(intervals=["1m"], candle_deque_maxlen=1)
+        candle = _make_candle(1)
+        c.candle_deques["1m"].append(candle)
+
+        _inject_close(c, "1m", dict(candle), dict(candle))
+
+        assert list(c.candle_deques["1m"]) == [candle]
+        assert not c.data_updated_event.is_set()
+
 
 # ===========================================================================
 # 7. _handle_candle_event RECONCILE semantics

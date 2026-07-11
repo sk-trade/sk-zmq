@@ -223,12 +223,13 @@ class ZMQClient:
                 new_candle = payload.get("new")
                 if not isinstance(candle, dict) or not isinstance(new_candle, dict):
                     return
+                previous_candles = list(target_deque)
                 if target_deque:
                     target_deque[-1] = candle
                 else:
                     target_deque.append(candle)
                 target_deque.append(new_candle)
-                updated = True
+                updated = list(target_deque) != previous_candles
             elif event_type == "RECONCILE":
                 reconciled_candle = payload.get("candle")
                 if not isinstance(reconciled_candle, dict):
