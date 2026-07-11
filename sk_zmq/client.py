@@ -437,8 +437,9 @@ class ZMQClient:
             except Exception as e:
                 logger.error(f"[{interval}] 구독 해지 요청 중 오류 발생: {e}")
 
+        current_thread = threading.current_thread()
         for t in self.threads:
-            if t.is_alive():
+            if t is not current_thread and t.is_alive():
                 t.join(timeout=5)
 
         self.context.term()

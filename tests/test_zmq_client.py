@@ -651,6 +651,16 @@ class TestStopAndThreadCleanup:
         assert client.stop_event.is_set()
         client.context.term.assert_called_once_with()
 
+    def test_stop_skips_joining_the_calling_registered_thread(self):
+        client = _make_client(intervals=["1m"])
+        client.threads.append(threading.current_thread())
+
+        with patch.object(client, "_send_request", return_value=None):
+            client.stop()
+
+        assert client.stop_event.is_set()
+        client.context.term.assert_called_once_with()
+
 
 def _noop_listener(client: ZMQClient) -> None:
     """A stand-in for _data_listener_thread that just waits for stop_event."""
