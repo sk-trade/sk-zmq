@@ -164,7 +164,7 @@ class ZMQClient:
                 socket_req.close()
 
             if attempt < max_retries - 1:
-                logger.info(f"{delay}초 후 재시도합니다...")
+                logger.debug(f"{delay}초 후 재시도합니다...")
                 time.sleep(delay)
                 delay = min(delay * 2, 30)
 
@@ -240,9 +240,7 @@ class ZMQClient:
                     if target_deque[i].get("ts") == reconciled_ts:
                         if target_deque[i] == reconciled_candle:
                             break
-                        logger.info(
-                            f"\n[INFO] [{interval}] 캔들 데이터 보정 발생! ts:{reconciled_ts}"
-                        )
+                        logger.debug(f"[{interval}] 캔들 데이터 보정 발생! ts:{reconciled_ts}")
                         target_deque[i] = reconciled_candle
                         updated = True
                         break
@@ -258,7 +256,7 @@ class ZMQClient:
         for interval in self.intervals:
             topic = f"{self.exchange_prefix}:CANDLE:{self.symbol}:{interval}:"
             socket_sub.setsockopt_string(zmq.SUBSCRIBE, topic)
-            logger.info(f"[{self.client_id}][SUB] 토픽 구독: '{topic}'")
+            logger.debug(f"[{self.client_id}][SUB] 토픽 구독: '{topic}'")
 
         while not self.stop_event.is_set():
             try:
@@ -286,7 +284,7 @@ class ZMQClient:
             renew_interval = 10
 
         while not self.stop_event.wait(renew_interval):
-            logger.info("모든 캔들 구독 갱신을 시작합니다...")
+            logger.debug("모든 캔들 구독 갱신을 시작합니다...")
 
             all_renewals_succeeded = True
 
@@ -391,7 +389,7 @@ class ZMQClient:
                 and all(isinstance(candle, dict) for candle in response["data"])
             ):
                 initial_snapshots[interval] = response["data"]
-                logger.info(f"✅ [{interval}] 스냅샷 수신 성공 ({len(response['data'])}개).")
+                logger.debug(f"✅ [{interval}] 스냅샷 수신 성공 ({len(response['data'])}개).")
             else:
                 logger.error(f"❌ [{interval}] 스냅샷 수신 실패. 클라이언트를 시작할 수 없습니다.")
                 return False

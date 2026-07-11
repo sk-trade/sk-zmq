@@ -8,6 +8,7 @@ under test never dials out.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections import deque
@@ -980,6 +981,21 @@ class TestLifecycleStartAndRenewal:
             req = call.args[0]
             assert req["action"] == "subscribe_candle"
             assert req["history_count"] == 1
+
+    def test_normal_renewal_start_is_debug_log(self, caplog):
+        client = _make_client(intervals=["1m"])
+
+        with caplog.at_level(logging.DEBUG, logger="sk_zmq.client"), \
+            patch.object(client, "_send_request", return_value={"status": "ok"}), \
+            patch.object(type(client.stop_event), "wait", _FiniteWait(1)):
+            client._subscription_renewer_thread()
+
+        renewal_records = [
+            record for record in caplog.records
+            if record.getMessage() == "모든 캔들 구독 갱신을 시작합니다..."
+        ]
+        assert len(renewal_records) == 1
+        assert renewal_records[0].levelno == logging.DEBUG
 
     def test_stop_sends_unsubscribe_for_each_interval(self):
         """stop() must send unsubscribe_candle for each subscribed interval."""
