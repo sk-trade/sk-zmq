@@ -217,7 +217,7 @@ class ZMQClient:
                     target_deque[-1] = candle
                 else:
                     target_deque.append(candle)
-                updated = True
+                updated = bool(target_deque)
             elif event_type == "CLOSE":
                 candle = payload.get("candle")
                 new_candle = payload.get("new")

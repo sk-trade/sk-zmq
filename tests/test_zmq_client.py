@@ -346,6 +346,14 @@ class TestHandleCandleEventUpdate:
         assert not c.data_updated_event.is_set()
         assert list(c.candle_deques["1m"]) == [candle]
 
+    def test_update_does_not_set_event_when_zero_capacity_stores_nothing(self):
+        c = _make_client(intervals=["1m"], candle_deque_maxlen=0)
+
+        _inject_update(c, "1m", _make_candle(1))
+
+        assert list(c.candle_deques["1m"]) == []
+        assert not c.data_updated_event.is_set()
+
     def test_update_missing_candle_key_ignored(self):
         c = _make_client(intervals=["1m"])
         c.data_updated_event.clear()
