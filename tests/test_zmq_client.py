@@ -1026,6 +1026,19 @@ class TestLifecycleStartAndRenewal:
         ) is None
         socket.setsockopt.assert_any_call(zmq.RCVTIMEO, 250)
 
+    def test_send_request_stops_retrying_when_shutdown_is_requested(self):
+        client = _make_client(intervals=["1m"])
+        socket = MagicMock()
+        socket.recv.side_effect = zmq.Again()
+        client.context.socket.return_value = socket
+        client.stop_event.set()
+
+        with patch("sk_zmq.client.time.sleep") as sleep:
+            assert client._send_request({"action": "subscribe_candle"}) is None
+
+        assert socket.send.call_count == 1
+        assert sleep.call_count == 0
+
     def test_start_returns_false_when_request_socket_setup_fails(self):
         client = _make_client(intervals=["1m"])
         client.context.socket.side_effect = zmq.ZMQError("socket setup failed")

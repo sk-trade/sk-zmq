@@ -182,6 +182,10 @@ class ZMQClient:
                     except Exception as e:
                         logger.error(f"ZMQ 요청 소켓 종료 중 오류 발생: {e}")
 
+            if self.stop_event.is_set():
+                logger.debug("종료 요청으로 ZMQ 요청 재시도를 중단합니다.")
+                return None
+
             if attempt < max_retries - 1:
                 logger.debug(f"{delay}초 후 재시도합니다...")
                 time.sleep(delay)
