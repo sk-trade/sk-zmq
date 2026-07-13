@@ -91,6 +91,7 @@ class ZMQClient:
 
         self.consecutive_renewal_failures = 0
         self.MAX_CONSECUTIVE_FAILURES = 3
+        self._listener_start_error: Optional[Exception] = None
 
         self.candle_deques: Dict[str, deque] = {
             interval: deque(maxlen=self.candle_deque_maxlen) for interval in self.intervals
@@ -279,34 +280,62 @@ class ZMQClient:
         if updated:
             self.data_updated_event.set()
 
-    def _data_listener_thread(self):
+    def _data_listener_thread(
+        self,
+        ready_event: Optional[threading.Event] = None,
+        run_event: Optional[threading.Event] = None,
+    ):
         """[스레드 타겟] ZMQ SUB 소켓을 통해 실시간 캔들 데이터를 구독하고 수신합니다."""
-        socket_sub = self.context.socket(zmq.SUB)
-        socket_sub.connect(f"tcp://{self.zmq_gateway_host}:{self.zmq_gateway_pub_port}")
-
-        for interval in self.intervals:
-            topic = f"{self.exchange_prefix}:CANDLE:{self.symbol}:{interval}:"
-            socket_sub.setsockopt_string(zmq.SUBSCRIBE, topic)
-            logger.debug(f"[{self.client_id}][SUB] 토픽 구독: '{topic}'")
-
-        while not self.stop_event.is_set():
+        socket_sub = None
+        try:
             try:
-                frames = socket_sub.recv_multipart(flags=zmq.NOBLOCK)
-                if not isinstance(frames, (list, tuple)) or len(frames) != 2:
-                    logger.warning(f"잘못된 캔들 이벤트 프레임을 무시합니다: {frames!r}")
+                socket_sub = self.context.socket(zmq.SUB)
+                socket_sub.connect(
+                    f"tcp://{self.zmq_gateway_host}:{self.zmq_gateway_pub_port}"
+                )
+
+                for interval in self.intervals:
+                    topic = f"{self.exchange_prefix}:CANDLE:{self.symbol}:{interval}:"
+                    socket_sub.setsockopt_string(zmq.SUBSCRIBE, topic)
+                    logger.debug(f"[{self.client_id}][SUB] 토픽 구독: '{topic}'")
+            except Exception as e:
+                self._listener_start_error = e
+                logger.error(f"ZMQ SUB 리스너 초기화 중 오류 발생: {e}")
+                if ready_event is not None:
+                    ready_event.set()
+                return
+
+            if ready_event is not None:
+                ready_event.set()
+
+            if run_event is not None:
+                while not run_event.wait(timeout=0.1):
+                    if self.stop_event.is_set():
+                        return
+
+            while not self.stop_event.is_set():
+                try:
+                    frames = socket_sub.recv_multipart(flags=zmq.NOBLOCK)
+                    if not isinstance(frames, (list, tuple)) or len(frames) != 2:
+                        logger.warning(f"잘못된 캔들 이벤트 프레임을 무시합니다: {frames!r}")
+                        continue
+                    topic_bytes, payload_bytes = frames
+                    topic_str = topic_bytes.decode()
+                    payload = orjson.loads(payload_bytes)
+                except zmq.Again:
+                    time.sleep(0.01)
                     continue
-                topic_bytes, payload_bytes = frames
-                topic_str = topic_bytes.decode()
-                payload = orjson.loads(payload_bytes)
-            except zmq.Again:
-                time.sleep(0.01)
-                continue
-            except (orjson.JSONDecodeError, UnicodeDecodeError, TypeError) as e:
-                logger.warning(f"잘못된 캔들 이벤트 페이로드를 무시합니다: {e}")
-                continue
-            self._handle_candle_event(topic_str, payload)
-        socket_sub.close()
-        logger.debug(f"\n[{self.client_id}][SUB] 데이터 리스너 종료.")
+                except (orjson.JSONDecodeError, UnicodeDecodeError, TypeError) as e:
+                    logger.warning(f"잘못된 캔들 이벤트 페이로드를 무시합니다: {e}")
+                    continue
+                self._handle_candle_event(topic_str, payload)
+        finally:
+            if socket_sub is not None:
+                try:
+                    socket_sub.close()
+                except Exception as e:
+                    logger.error(f"ZMQ SUB 리스너 소켓 종료 중 오류 발생: {e}")
+            logger.debug(f"\n[{self.client_id}][SUB] 데이터 리스너 종료.")
 
     def _subscription_renewer_thread(self):
         """[스레드 타겟] 게이트웨이의 구독 TTL이 만료되기 전에 주기적으로 구독을 갱신합니다."""
@@ -435,17 +464,40 @@ class ZMQClient:
                 logger.error(f"❌ [{interval}] 스냅샷 수신 실패. 클라이언트를 시작할 수 없습니다.")
                 return False
 
-        # Do not leave a partial initial state behind when a later request fails.
+        listener_ready = threading.Event()
+        listener_run = threading.Event()
+        self._listener_start_error = None
+        listener = threading.Thread(
+            target=self._data_listener_thread,
+            args=(listener_ready, listener_run),
+            name="ZMQListener",
+        )
+        listener.start()
+        listener_ready.wait()
+
+        if self._listener_start_error is not None:
+            listener.join(timeout=1)
+            logger.error(
+                "ZMQ SUB 리스너를 초기화하지 못해 클라이언트를 시작할 수 없습니다."
+            )
+            return False
+
+        if self.stop_event.is_set():
+            listener_run.set()
+            listener.join(timeout=1)
+            return False
+
+        # Do not expose snapshots or receive live events until listener setup succeeds.
         with self.storage_lock:
             for interval, snapshot in initial_snapshots.items():
                 self.candle_deques[interval].extend(snapshot)
 
-        listener = threading.Thread(target=self._data_listener_thread, name="ZMQListener")
         renewer = threading.Thread(target=self._subscription_renewer_thread, name="SubscriptionRenewer")
         trigger = threading.Thread(target=self._strategy_trigger_thread, name="StrategyTrigger")
         self.threads.extend([listener, renewer, trigger])
-        for t in self.threads:
+        for t in (renewer, trigger):
             t.start()
+        listener_run.set()
 
         logger.info("✅ 모든 스냅샷 수신 완료. 실시간 분석을 시작합니다.")
         return True

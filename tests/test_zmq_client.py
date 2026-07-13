@@ -682,6 +682,13 @@ def _noop_listener(client: ZMQClient) -> None:
     client.stop_event.wait()
 
 
+def _ready_listener(ready_event=None, run_event=None) -> None:
+    if ready_event is not None:
+        ready_event.set()
+    if run_event is not None:
+        run_event.wait(timeout=1)
+
+
 class _InvalidJsonThenStopSocket:
     def __init__(self, client: ZMQClient):
         self.client = client
@@ -917,7 +924,7 @@ class TestLifecycleStartAndRenewal:
         ]
 
         with patch.object(client, "_send_request", side_effect=responses) as send_request, \
-            patch.object(client, "_data_listener_thread", return_value=None), \
+            patch.object(client, "_data_listener_thread", side_effect=_ready_listener), \
             patch.object(client, "_strategy_trigger_thread", return_value=None), \
             patch.object(client, "_subscription_renewer_thread", return_value=None):
             assert client.start() is True
@@ -989,7 +996,7 @@ class TestLifecycleStartAndRenewal:
         ]
 
         with patch.object(client, "_send_request", side_effect=responses), \
-            patch.object(client, "_data_listener_thread", return_value=None), \
+            patch.object(client, "_data_listener_thread", side_effect=_ready_listener), \
             patch.object(client, "_strategy_trigger_thread", return_value=None), \
             patch.object(client, "_subscription_renewer_thread", return_value=None):
             assert client.start() is False
@@ -1076,6 +1083,55 @@ class TestLifecycleStartAndRenewal:
 
         assert client.context.socket.call_count == 5
         assert client.threads == []
+
+    def test_start_returns_false_when_listener_socket_creation_fails(self):
+        client = _make_client(intervals=["1m"])
+        client.context.socket.side_effect = zmq.ZMQError("SUB setup failed")
+
+        with patch.object(
+            client,
+            "_send_request",
+            return_value={"status": "ok", "data": [_make_candle(1)]},
+        ), patch.object(
+            client,
+            "_subscription_renewer_thread",
+            return_value=None,
+        ) as renewer, patch.object(
+            client,
+            "_strategy_trigger_thread",
+            return_value=None,
+        ) as trigger, patch("threading.excepthook"):
+            assert client.start() is False
+
+        assert client.threads == []
+        assert list(client.candle_deques["1m"]) == []
+        renewer.assert_not_called()
+        trigger.assert_not_called()
+
+    def test_start_closes_listener_socket_when_connect_fails(self):
+        client = _make_client(intervals=["1m"])
+        socket = MagicMock()
+        socket.connect.side_effect = zmq.ZMQError("SUB connect failed")
+        client.context.socket.return_value = socket
+
+        with patch.object(
+            client,
+            "_send_request",
+            return_value={"status": "ok", "data": [_make_candle(1)]},
+        ), patch.object(
+            client,
+            "_subscription_renewer_thread",
+            return_value=None,
+        ), patch.object(
+            client,
+            "_strategy_trigger_thread",
+            return_value=None,
+        ), patch("threading.excepthook"):
+            assert client.start() is False
+
+        socket.close.assert_called_once_with()
+        assert client.threads == []
+        assert list(client.candle_deques["1m"]) == []
 
     def test_renewer_counts_truthy_non_dict_response_as_failure(self):
         client = _make_client(intervals=["1m"])
