@@ -23,6 +23,8 @@ class ZMQClient:
     6. 별도의 스레드에서 모든 네트워크 I/O 및 주기적 작업을 처리하여 메인 스레드를 블로킹하지 않음.
     """
 
+    _STOP_UNSUBSCRIBE_TIMEOUT_MS = 1000
+
     def __init__(
         self,
         client_id: str,
@@ -128,12 +130,21 @@ class ZMQClient:
                 for k, v in self.candle_deques.items()
             }
 
-    def _send_request(self, request: dict, max_retries: int = 5, initial_delay: int = 2) -> Optional[dict]:
+    def _send_request(
+        self,
+        request: dict,
+        max_retries: int = 5,
+        initial_delay: int = 2,
+        receive_timeout_ms: int = 10000,
+    ) -> Optional[dict]:
         """
         ZMQ REQ 소켓을 사용해 게이트웨이에 동기식 요청을 보내고 응답을 받습니다.
 
         Args:
             request (dict): 게이트웨이로 전송할 요청 메시지 (JSON 직렬화 가능해야 함).
+            max_retries (int): 최대 요청 시도 횟수.
+            initial_delay (int): 재시도 전 초기 대기 시간(초).
+            receive_timeout_ms (int): 각 응답을 기다릴 최대 시간(밀리초).
 
         Returns:
             Optional[dict]: 게이트웨이로부터 받은 응답. 타임아웃 또는 오류 발생 시 None을 반환.
@@ -143,7 +154,7 @@ class ZMQClient:
             socket_req = None
             try:
                 socket_req = self.context.socket(zmq.REQ)
-                socket_req.setsockopt(zmq.RCVTIMEO, 10000)
+                socket_req.setsockopt(zmq.RCVTIMEO, receive_timeout_ms)
                 socket_req.setsockopt(zmq.LINGER, 0)
                 socket_req.connect(
                     f"tcp://{self.zmq_gateway_host}:{self.zmq_gateway_req_port}"
@@ -438,7 +449,9 @@ class ZMQClient:
                         "symbol": self.symbol,
                         "interval": interval,
                         "exchange": self.exchange,
-                    }
+                    },
+                    max_retries=1,
+                    receive_timeout_ms=self._STOP_UNSUBSCRIBE_TIMEOUT_MS,
                 )
             except Exception as e:
                 logger.error(f"[{interval}] 구독 해지 요청 중 오류 발생: {e}")

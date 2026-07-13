@@ -652,6 +652,20 @@ class TestStopAndThreadCleanup:
         assert client.stop_event.is_set()
         client.context.term.assert_called_once_with()
 
+    def test_stop_uses_bounded_unsubscribe_request_budget(self):
+        client = _make_client(intervals=["1m", "5m"])
+
+        with patch.object(client, "_send_request", return_value=None) as send_request:
+            client.stop()
+
+        assert send_request.call_count == 2
+        for call in send_request.call_args_list:
+            assert call.kwargs == {
+                "max_retries": 1,
+                "receive_timeout_ms": client._STOP_UNSUBSCRIBE_TIMEOUT_MS,
+            }
+        client.context.term.assert_called_once_with()
+
     def test_stop_skips_joining_the_calling_registered_thread(self):
         client = _make_client(intervals=["1m"])
         client.threads.append(threading.current_thread())
@@ -998,6 +1012,19 @@ class TestLifecycleStartAndRenewal:
 
         assert client._send_request({"action": "subscribe_candle"}, max_retries=1) is None
         socket.close.assert_called_once_with()
+
+    def test_send_request_uses_custom_receive_timeout(self):
+        client = _make_client(intervals=["1m"])
+        socket = MagicMock()
+        socket.recv.side_effect = zmq.Again()
+        client.context.socket.return_value = socket
+
+        assert client._send_request(
+            {"action": "unsubscribe_candle"},
+            max_retries=1,
+            receive_timeout_ms=250,
+        ) is None
+        socket.setsockopt.assert_any_call(zmq.RCVTIMEO, 250)
 
     def test_start_returns_false_when_request_socket_setup_fails(self):
         client = _make_client(intervals=["1m"])
