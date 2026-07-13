@@ -86,8 +86,10 @@ class ZMQClient:
         self.context = zmq.Context()
         self.stop_event = threading.Event()
         self.storage_lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
         self._subscription_request_lock = threading.Lock()
         self.data_updated_event = threading.Event()
+        self._stopped = False
 
         self.consecutive_renewal_failures = 0
         self.MAX_CONSECUTIVE_FAILURES = 3
@@ -438,6 +440,10 @@ class ZMQClient:
         Returns:
             bool: 초기화 및 스레드 시작에 성공하면 True, 실패하면 False.
         """
+        with self._lifecycle_lock:
+            if self._stopped or self.stop_event.is_set():
+                return False
+
         logger.info("ZMQ 게이트웨이에 연결 및 스냅샷 요청을 시작합니다...")
 
         initial_snapshots: Dict[str, list] = {}
@@ -449,7 +455,13 @@ class ZMQClient:
                 "history_count": self.candle_deque_maxlen,
                 "exchange": self.exchange,
             }
-            response = self._send_request(req)
+            with self._subscription_request_lock:
+                if self.stop_event.is_set():
+                    return False
+                response = self._send_request(req)
+
+            if self.stop_event.is_set():
+                return False
 
             if (
                 isinstance(response, dict)
@@ -472,7 +484,11 @@ class ZMQClient:
             args=(listener_ready, listener_run),
             name="ZMQListener",
         )
-        listener.start()
+        try:
+            listener.start()
+        except Exception as e:
+            logger.error(f"ZMQ SUB 리스너 스레드 시작 중 오류 발생: {e}")
+            return False
         listener_ready.wait()
 
         if self._listener_start_error is not None:
@@ -482,22 +498,56 @@ class ZMQClient:
             )
             return False
 
-        if self.stop_event.is_set():
+        prepared_threads = [listener]
+
+        def rollback_prepared_threads() -> None:
             listener_run.set()
-            listener.join(timeout=1)
-            return False
+            current_thread = threading.current_thread()
+            for thread in prepared_threads:
+                if thread is not current_thread and thread.is_alive():
+                    thread.join(timeout=5)
 
-        # Do not expose snapshots or receive live events until listener setup succeeds.
-        with self.storage_lock:
-            for interval, snapshot in initial_snapshots.items():
-                self.candle_deques[interval].extend(snapshot)
+        with self._lifecycle_lock:
+            if self._stopped or self.stop_event.is_set():
+                rollback_prepared_threads()
+                return False
 
-        renewer = threading.Thread(target=self._subscription_renewer_thread, name="SubscriptionRenewer")
-        trigger = threading.Thread(target=self._strategy_trigger_thread, name="StrategyTrigger")
-        self.threads.extend([listener, renewer, trigger])
-        for t in (renewer, trigger):
-            t.start()
-        listener_run.set()
+            try:
+                renewer = threading.Thread(
+                    target=self._subscription_renewer_thread,
+                    name="SubscriptionRenewer",
+                )
+                trigger = threading.Thread(
+                    target=self._strategy_trigger_thread,
+                    name="StrategyTrigger",
+                )
+                for thread in (renewer, trigger):
+                    if self.stop_event.is_set():
+                        rollback_prepared_threads()
+                        return False
+                    thread.start()
+                    prepared_threads.append(thread)
+            except Exception as e:
+                logger.error(f"ZMQ 백그라운드 스레드 시작 중 오류 발생: {e}")
+                self.stop_event.set()
+                rollback_prepared_threads()
+                return False
+
+            # Publish snapshots and registered threads as one lifecycle transition.
+            startup_canceled = False
+            with self.storage_lock:
+                if self._stopped or self.stop_event.is_set():
+                    startup_canceled = True
+                else:
+                    for interval, snapshot in initial_snapshots.items():
+                        self.candle_deques[interval].extend(snapshot)
+
+            if startup_canceled:
+                rollback_prepared_threads()
+                return False
+
+            self.threads.extend(prepared_threads)
+            listener_run.set()
 
         logger.info("✅ 모든 스냅샷 수신 완료. 실시간 분석을 시작합니다.")
         return True
@@ -509,33 +559,36 @@ class ZMQClient:
         모든 백그라운드 스레드에 종료 신호를 보내고, 게이트웨이에 구독 해지를
         요청한 후, 스레드가 종료될 때까지 대기합니다.
         """
-        if self.stop_event.is_set():
-            return
-
-        logger.info("ZMQ 클라이언트 종료 절차 시작...")
         self.stop_event.set()
 
-        with self._subscription_request_lock:
-            for interval in self.intervals:
-                logger.debug(f"[{interval}] 구독 해지 요청 중...")
-                try:
-                    self._send_request(
-                        {
-                            "action": "unsubscribe_candle",
-                            "symbol": self.symbol,
-                            "interval": interval,
-                            "exchange": self.exchange,
-                        },
-                        max_retries=1,
-                        receive_timeout_ms=self._STOP_UNSUBSCRIBE_TIMEOUT_MS,
-                    )
-                except Exception as e:
-                    logger.error(f"[{interval}] 구독 해지 요청 중 오류 발생: {e}")
+        with self._lifecycle_lock:
+            if self._stopped:
+                return
 
-        current_thread = threading.current_thread()
-        for t in self.threads:
-            if t is not current_thread and t.is_alive():
-                t.join(timeout=5)
+            logger.info("ZMQ 클라이언트 종료 절차 시작...")
 
-        self.context.term()
-        logger.info("ZMQ 클라이언트가 성공적으로 종료되었습니다.")
+            with self._subscription_request_lock:
+                for interval in self.intervals:
+                    logger.debug(f"[{interval}] 구독 해지 요청 중...")
+                    try:
+                        self._send_request(
+                            {
+                                "action": "unsubscribe_candle",
+                                "symbol": self.symbol,
+                                "interval": interval,
+                                "exchange": self.exchange,
+                            },
+                            max_retries=1,
+                            receive_timeout_ms=self._STOP_UNSUBSCRIBE_TIMEOUT_MS,
+                        )
+                    except Exception as e:
+                        logger.error(f"[{interval}] 구독 해지 요청 중 오류 발생: {e}")
+
+            current_thread = threading.current_thread()
+            for t in self.threads:
+                if t is not current_thread and t.is_alive():
+                    t.join(timeout=5)
+
+            self.context.term()
+            self._stopped = True
+            logger.info("ZMQ 클라이언트가 성공적으로 종료되었습니다.")

@@ -1133,6 +1133,130 @@ class TestLifecycleStartAndRenewal:
         assert client.threads == []
         assert list(client.candle_deques["1m"]) == []
 
+    def test_start_stops_snapshot_requests_after_shutdown(self):
+        client = _make_client(intervals=["1m", "5m"])
+        first_snapshot_started = threading.Event()
+        release_first_snapshot = threading.Event()
+        both_unsubscribed = threading.Event()
+        calls = []
+        calls_lock = threading.Lock()
+        start_result = []
+
+        def send_request(request, **_kwargs):
+            action = request["action"]
+            interval = request["interval"]
+            if action == "subscribe_candle" and interval == "1m":
+                first_snapshot_started.set()
+                assert release_first_snapshot.wait(timeout=2)
+            with calls_lock:
+                calls.append((action, interval))
+                if sum(action == "unsubscribe_candle" for action, _ in calls) == 2:
+                    both_unsubscribed.set()
+            if action == "subscribe_candle":
+                return {"status": "ok", "data": [_make_candle(1)]}
+            return {"status": "ok"}
+
+        with patch.object(client, "_send_request", side_effect=send_request), \
+            patch.object(client, "_data_listener_thread", side_effect=_ready_listener), \
+            patch.object(client, "_strategy_trigger_thread", return_value=None), \
+            patch.object(client, "_subscription_renewer_thread", return_value=None):
+            starter = threading.Thread(target=lambda: start_result.append(client.start()))
+            starter.start()
+            assert first_snapshot_started.wait(timeout=1)
+
+            stopper = threading.Thread(target=client.stop)
+            stopper.start()
+            both_unsubscribed.wait(timeout=0.25)
+            release_first_snapshot.set()
+
+            starter.join(timeout=2)
+            stopper.join(timeout=2)
+
+        assert start_result == [False]
+        assert not starter.is_alive()
+        assert not stopper.is_alive()
+        assert calls == [
+            ("subscribe_candle", "1m"),
+            ("unsubscribe_candle", "1m"),
+            ("unsubscribe_candle", "5m"),
+        ]
+        assert client.threads == []
+
+    def test_stop_prevents_startup_publication_after_final_check(self):
+        client = _make_client(intervals=["1m"])
+        storage_entered = threading.Event()
+        release_storage = threading.Event()
+        start_result = []
+
+        class BlockingStorageLock:
+            def __enter__(self):
+                storage_entered.set()
+                assert release_storage.wait(timeout=2)
+
+            def __exit__(self, *_args):
+                return False
+
+        client.storage_lock = BlockingStorageLock()
+
+        with patch.object(
+            client,
+            "_send_request",
+            return_value={"status": "ok", "data": [_make_candle(1)]},
+        ), patch.object(
+            client,
+            "_data_listener_thread",
+            side_effect=_ready_listener,
+        ), patch.object(
+            client,
+            "_strategy_trigger_thread",
+            return_value=None,
+        ), patch.object(
+            client,
+            "_subscription_renewer_thread",
+            return_value=None,
+        ):
+            starter = threading.Thread(target=lambda: start_result.append(client.start()))
+            starter.start()
+            assert storage_entered.wait(timeout=1)
+
+            stopper = threading.Thread(target=client.stop)
+            stopper.start()
+            assert client.stop_event.wait(timeout=1)
+            release_storage.set()
+
+            starter.join(timeout=2)
+            stopper.join(timeout=2)
+
+        assert start_result == [False]
+        assert client.threads == []
+        client.context.term.assert_called_once_with()
+
+    def test_start_rolls_back_when_worker_thread_cannot_start(self):
+        client = _make_client(intervals=["1m"])
+        real_thread = threading.Thread
+        created_threads = []
+
+        def create_thread(*args, **kwargs):
+            kwargs["daemon"] = True
+            thread = real_thread(*args, **kwargs)
+            created_threads.append(thread)
+            if thread.name == "SubscriptionRenewer":
+                thread.start = MagicMock(side_effect=RuntimeError("can't start thread"))
+            return thread
+
+        with patch.object(
+            client,
+            "_send_request",
+            return_value={"status": "ok", "data": [_make_candle(1)]},
+        ), patch("sk_zmq.client.threading.Thread", side_effect=create_thread):
+            assert client.start() is False
+            client.stop()
+
+        assert client.threads == []
+        assert list(client.candle_deques["1m"]) == []
+        assert all(not thread.is_alive() for thread in created_threads)
+        client.context.term.assert_called_once_with()
+
     def test_renewer_counts_truthy_non_dict_response_as_failure(self):
         client = _make_client(intervals=["1m"])
 
