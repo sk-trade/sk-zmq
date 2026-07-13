@@ -21,7 +21,8 @@ uv build
 ## Usage
 
 A compatible candle gateway must already be running at the configured host and
-ports. `start()` returns `False` if any initial snapshot cannot be loaded.
+ports. `start()` returns `False` if an initial snapshot cannot be loaded or the
+local SUB listener cannot be initialized.
 
 ```python
 import time
@@ -61,8 +62,8 @@ client = ZMQClient(
 try:
     if not client.start():
         raise RuntimeError(
-            "Could not load initial candles. Check the gateway address, "
-            "ports, exchange, symbol, and intervals."
+            "Could not start the ZMQ client. Check the gateway request/PUB "
+            "addresses, ports, exchange, symbol, and intervals."
         )
     while True:
         time.sleep(1)
