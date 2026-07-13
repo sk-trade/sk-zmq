@@ -877,6 +877,20 @@ class _RecordingWait:
         return True
 
 
+class _StopOnWait:
+    def __init__(self):
+        self.stopped = False
+        self.timeouts = []
+
+    def is_set(self):
+        return self.stopped
+
+    def wait(self, timeout=None):
+        self.timeouts.append(timeout)
+        self.stopped = True
+        return True
+
+
 class TestLifecycleStartAndRenewal:
     """Lifecycle tests around start() and subscription renewal behavior."""
 
@@ -1039,11 +1053,25 @@ class TestLifecycleStartAndRenewal:
         assert socket.send.call_count == 1
         assert sleep.call_count == 0
 
+    def test_send_request_interrupts_retry_backoff_on_shutdown(self):
+        client = _make_client(intervals=["1m"])
+        socket = MagicMock()
+        socket.recv.side_effect = zmq.Again()
+        client.context.socket.return_value = socket
+        stop_event = _StopOnWait()
+        client.stop_event = stop_event
+
+        with patch("sk_zmq.client.time.sleep"):
+            assert client._send_request({"action": "subscribe_candle"}) is None
+
+        assert socket.send.call_count == 1
+        assert stop_event.timeouts == [2]
+
     def test_start_returns_false_when_request_socket_setup_fails(self):
         client = _make_client(intervals=["1m"])
         client.context.socket.side_effect = zmq.ZMQError("socket setup failed")
 
-        with patch("sk_zmq.client.time.sleep"):
+        with patch.object(type(client.stop_event), "wait", return_value=False):
             assert client.start() is False
 
         assert client.context.socket.call_count == 5
