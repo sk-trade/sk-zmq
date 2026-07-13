@@ -86,6 +86,7 @@ class ZMQClient:
         self.context = zmq.Context()
         self.stop_event = threading.Event()
         self.storage_lock = threading.Lock()
+        self._subscription_request_lock = threading.Lock()
         self.data_updated_event = threading.Event()
 
         self.consecutive_renewal_failures = 0
@@ -315,6 +316,7 @@ class ZMQClient:
             logger.debug("모든 캔들 구독 갱신을 시작합니다...")
 
             all_renewals_succeeded = True
+            renewal_cycle_canceled = False
 
             for interval in self.intervals:
                 request = {
@@ -324,11 +326,22 @@ class ZMQClient:
                     "history_count": 1,
                     "exchange": self.exchange,
                 }
-                response = self._send_request(request)
+                with self._subscription_request_lock:
+                    if self.stop_event.is_set():
+                        renewal_cycle_canceled = True
+                        break
+                    response = self._send_request(request)
+
+                if self.stop_event.is_set():
+                    renewal_cycle_canceled = True
+                    break
 
                 if not (isinstance(response, dict) and response.get("status") == "ok"):
                     all_renewals_succeeded = False
                     logger.error(f"❌ [{interval}] 구독 갱신에 최종 실패했습니다! 응답: {response}")
+
+            if renewal_cycle_canceled:
+                break
 
             if all_renewals_succeeded:
                 if self.consecutive_renewal_failures > 0:
@@ -450,21 +463,22 @@ class ZMQClient:
         logger.info("ZMQ 클라이언트 종료 절차 시작...")
         self.stop_event.set()
 
-        for interval in self.intervals:
-            logger.debug(f"[{interval}] 구독 해지 요청 중...")
-            try:
-                self._send_request(
-                    {
-                        "action": "unsubscribe_candle",
-                        "symbol": self.symbol,
-                        "interval": interval,
-                        "exchange": self.exchange,
-                    },
-                    max_retries=1,
-                    receive_timeout_ms=self._STOP_UNSUBSCRIBE_TIMEOUT_MS,
-                )
-            except Exception as e:
-                logger.error(f"[{interval}] 구독 해지 요청 중 오류 발생: {e}")
+        with self._subscription_request_lock:
+            for interval in self.intervals:
+                logger.debug(f"[{interval}] 구독 해지 요청 중...")
+                try:
+                    self._send_request(
+                        {
+                            "action": "unsubscribe_candle",
+                            "symbol": self.symbol,
+                            "interval": interval,
+                            "exchange": self.exchange,
+                        },
+                        max_retries=1,
+                        receive_timeout_ms=self._STOP_UNSUBSCRIBE_TIMEOUT_MS,
+                    )
+                except Exception as e:
+                    logger.error(f"[{interval}] 구독 해지 요청 중 오류 발생: {e}")
 
         current_thread = threading.current_thread()
         for t in self.threads:

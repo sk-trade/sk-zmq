@@ -1171,3 +1171,64 @@ class TestLifecycleStartAndRenewal:
         for call in unsubscribe_calls:
             assert call["symbol"] == "KRW-BTC"
             assert call["exchange"] == "upbit"
+
+    def test_stop_unsubscribes_after_in_flight_renewal(self):
+        critical_calls = []
+        client = _make_client(
+            intervals=["1m", "5m"],
+            on_critical=critical_calls.append,
+        )
+        real_wait = client.stop_event.wait
+        first_wait = True
+        first_renewal_started = threading.Event()
+        release_first_renewal = threading.Event()
+        both_unsubscribed = threading.Event()
+        calls = []
+        calls_lock = threading.Lock()
+
+        def enter_one_renewal_cycle(timeout=None):
+            nonlocal first_wait
+            if first_wait:
+                first_wait = False
+                return False
+            return real_wait(timeout)
+
+        def send_request(request, **_kwargs):
+            action = request["action"]
+            interval = request["interval"]
+            if action == "subscribe_candle" and interval == "1m":
+                first_renewal_started.set()
+                assert release_first_renewal.wait(timeout=2)
+            with calls_lock:
+                calls.append((action, interval))
+                unsubscribe_count = sum(
+                    recorded_action == "unsubscribe_candle"
+                    for recorded_action, _ in calls
+                )
+                if unsubscribe_count == 2:
+                    both_unsubscribed.set()
+            return {"status": "ok"}
+
+        with patch.object(client.stop_event, "wait", side_effect=enter_one_renewal_cycle), \
+            patch.object(client, "_send_request", side_effect=send_request):
+            renewer = threading.Thread(target=client._subscription_renewer_thread)
+            renewer.start()
+            assert first_renewal_started.wait(timeout=1)
+
+            stopper = threading.Thread(target=client.stop)
+            stopper.start()
+            both_unsubscribed.wait(timeout=0.25)
+            release_first_renewal.set()
+
+            stopper.join(timeout=2)
+            renewer.join(timeout=2)
+
+        assert not stopper.is_alive()
+        assert not renewer.is_alive()
+        assert calls == [
+            ("subscribe_candle", "1m"),
+            ("unsubscribe_candle", "1m"),
+            ("unsubscribe_candle", "5m"),
+        ]
+        assert client.consecutive_renewal_failures == 0
+        assert critical_calls == []
