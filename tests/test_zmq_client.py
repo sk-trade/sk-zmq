@@ -15,6 +15,7 @@ from collections import deque
 from unittest.mock import MagicMock, patch
 
 import pytest
+import zmq
 
 from sk_zmq.client import ZMQClient
 
@@ -958,6 +959,31 @@ class TestLifecycleStartAndRenewal:
 
         assert client._send_request({"action": "subscribe_candle"}, max_retries=1) is None
         assert socket.closed
+
+    def test_send_request_handles_socket_creation_failure(self):
+        client = _make_client(intervals=["1m"])
+        client.context.socket.side_effect = zmq.ZMQError("socket setup failed")
+
+        assert client._send_request({"action": "subscribe_candle"}, max_retries=1) is None
+
+    def test_send_request_closes_socket_when_connect_fails(self):
+        client = _make_client(intervals=["1m"])
+        socket = MagicMock()
+        socket.connect.side_effect = zmq.ZMQError("connect failed")
+        client.context.socket.return_value = socket
+
+        assert client._send_request({"action": "subscribe_candle"}, max_retries=1) is None
+        socket.close.assert_called_once_with()
+
+    def test_start_returns_false_when_request_socket_setup_fails(self):
+        client = _make_client(intervals=["1m"])
+        client.context.socket.side_effect = zmq.ZMQError("socket setup failed")
+
+        with patch("sk_zmq.client.time.sleep"):
+            assert client.start() is False
+
+        assert client.context.socket.call_count == 5
+        assert client.threads == []
 
     def test_renewer_counts_truthy_non_dict_response_as_failure(self):
         client = _make_client(intervals=["1m"])

@@ -138,12 +138,14 @@ class ZMQClient:
         """
         delay = initial_delay
         for attempt in range(max_retries):
-            socket_req = self.context.socket(zmq.REQ)
-            socket_req.setsockopt(zmq.RCVTIMEO, 10000)
-            socket_req.setsockopt(zmq.LINGER, 0)
-            socket_req.connect(f"tcp://{self.zmq_gateway_host}:{self.zmq_gateway_req_port}")
-
+            socket_req = None
             try:
+                socket_req = self.context.socket(zmq.REQ)
+                socket_req.setsockopt(zmq.RCVTIMEO, 10000)
+                socket_req.setsockopt(zmq.LINGER, 0)
+                socket_req.connect(
+                    f"tcp://{self.zmq_gateway_host}:{self.zmq_gateway_req_port}"
+                )
                 socket_req.send(orjson.dumps(request))
                 response = orjson.loads(socket_req.recv())
                 if not isinstance(response, dict):
@@ -161,7 +163,11 @@ class ZMQClient:
                     f"ZMQ 요청 중 오류 발생 (시도 {attempt + 1}/{max_retries}): {e}"
                 )
             finally:
-                socket_req.close()
+                if socket_req is not None:
+                    try:
+                        socket_req.close()
+                    except Exception as e:
+                        logger.error(f"ZMQ 요청 소켓 종료 중 오류 발생: {e}")
 
             if attempt < max_retries - 1:
                 logger.debug(f"{delay}초 후 재시도합니다...")
