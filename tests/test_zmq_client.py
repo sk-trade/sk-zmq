@@ -854,8 +854,32 @@ class _FiniteWait:
         return self.calls > self.cycles
 
 
+class _RecordingWait:
+    def __init__(self):
+        self.timeouts = []
+
+    def __call__(self, timeout=None) -> bool:
+        self.timeouts.append(timeout)
+        return True
+
+
 class TestLifecycleStartAndRenewal:
     """Lifecycle tests around start() and subscription renewal behavior."""
+
+    @pytest.mark.parametrize("server_candle_ttl", [0, -1])
+    def test_non_positive_server_candle_ttl_raises(self, server_candle_ttl):
+        with pytest.raises(ValueError, match="server_candle_ttl"):
+            _make_client(server_candle_ttl=server_candle_ttl)
+
+    def test_short_ttl_schedules_renewal_before_expiration(self):
+        client = _make_client(server_candle_ttl=5)
+        wait = _RecordingWait()
+
+        with patch.object(type(client.stop_event), "wait", wait):
+            client._subscription_renewer_thread()
+
+        assert len(wait.timeouts) == 1
+        assert 0 < wait.timeouts[0] < client.server_candle_ttl
 
     def test_start_sends_initial_snapshot_requests_for_all_intervals(self):
         client = _make_client(intervals=["1m", "5m"], candle_deque_maxlen=4)

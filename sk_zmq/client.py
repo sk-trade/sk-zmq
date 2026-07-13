@@ -55,7 +55,7 @@ class ZMQClient:
             zmq_gateway_host (str): ZMQ 게이트웨이 호스트.
             zmq_gateway_req_port (int): ZMQ REQ 포트.
             zmq_gateway_pub_port (int): ZMQ PUB 포트.
-            server_candle_ttl (int): 서버 캔들 구독 TTL (초). 기본값 300.
+            server_candle_ttl (int): 서버 캔들 구독 TTL (초). 0보다 커야 하며 기본값은 300.
             candle_deque_maxlen (int): 캔들 덱 최대 길이. 기본값 200.
             on_critical (Optional[Callable[[str], None]]): 치명적 이벤트 시 호출될 콜백.
             callback_snapshot_mode (str): 콜백에 전달할 스냅샷 모드.
@@ -74,6 +74,8 @@ class ZMQClient:
         self.zmq_gateway_host = zmq_gateway_host
         self.zmq_gateway_req_port = zmq_gateway_req_port
         self.zmq_gateway_pub_port = zmq_gateway_pub_port
+        if server_candle_ttl <= 0:
+            raise ValueError("server_candle_ttl must be greater than 0.")
         self.server_candle_ttl = server_candle_ttl
         self.candle_deque_maxlen = candle_deque_maxlen
         self.on_critical = on_critical
@@ -286,9 +288,7 @@ class ZMQClient:
 
     def _subscription_renewer_thread(self):
         """[스레드 타겟] 게이트웨이의 구독 TTL이 만료되기 전에 주기적으로 구독을 갱신합니다."""
-        renew_interval = (self.server_candle_ttl / 2) - 10
-        if renew_interval < 10:
-            renew_interval = 10
+        renew_interval = self.server_candle_ttl / 2
 
         while not self.stop_event.wait(renew_interval):
             logger.debug("모든 캔들 구독 갱신을 시작합니다...")
