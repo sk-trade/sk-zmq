@@ -20,13 +20,22 @@ uv build
 
 ## Usage
 
+A compatible candle gateway must already be running at the configured host and
+ports. `start()` returns `False` if an initial snapshot cannot be loaded or the
+local SUB listener cannot be initialized.
+
 ```python
+import time
+
 from sk_zmq import ZMQClient
 
 
 def on_candle_update(candle_deques):
-    # Treat as read-only unless using deep_copy
-    pass
+    latest = {
+        interval: candles[-1] if candles else None
+        for interval, candles in candle_deques.items()
+    }
+    print(latest)
 
 
 def on_critical(msg: str):
@@ -46,11 +55,22 @@ client = ZMQClient(
     server_candle_ttl=300,
     candle_deque_maxlen=200,
     on_critical=on_critical,
-    callback_snapshot_mode="live",  # "live", "deque_copy", "deep_copy"
+    callback_snapshot_mode="deque_copy",  # "live", "deque_copy", "deep_copy"
     exchange="upbit",
 )
 
-client.start()
+try:
+    if not client.start():
+        raise RuntimeError(
+            "Could not start the ZMQ client. Check the gateway request/PUB "
+            "addresses, ports, exchange, symbol, and intervals."
+        )
+    while True:
+        time.sleep(1)
+except KeyboardInterrupt:
+    pass
+finally:
+    client.stop()
 ```
 
 ## Exchange and payload expectations
