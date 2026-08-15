@@ -19,8 +19,6 @@ import zmq
 from sk_zmq.client import (
     GatewayRequestCode,
     GatewayRequestResult,
-    ListenerStartCode,
-    ListenerStartResult,
     ZMQClient,
 )
 
@@ -134,13 +132,23 @@ class TestIntervalValidation:
         c = _make_client(intervals=["1m"], candle_deque_maxlen=42)
         assert c.candle_deques["1m"].maxlen == 42
 
-    def test_invalid_deque_maxlen_fails_before_context_allocation(self):
+    @pytest.mark.parametrize(
+        ("intervals", "candle_deque_maxlen"),
+        [
+            ([], 10),
+            (["1m"], 0),
+            (["1m"], -1),
+        ],
+    )
+    def test_unusable_subscription_config_fails_before_context_allocation(
+        self, intervals, candle_deque_maxlen
+    ):
         with patch("sk_zmq.client.zmq.Context") as context_factory:
             with pytest.raises(ValueError):
                 ZMQClient(
-                    intervals=["1m"],
+                    intervals=intervals,
                     candle_handler_callback=lambda _payload: None,
-                    candle_deque_maxlen=-1,
+                    candle_deque_maxlen=candle_deque_maxlen,
                     **_COMMON_KWARGS,
                 )
 
@@ -152,17 +160,10 @@ class TestIntervalValidation:
 # ===========================================================================
 
 class TestCallbackSnapshotModeValidation:
-    def test_live_accepted(self):
-        c = _make_client(callback_snapshot_mode="live")
-        assert c.callback_snapshot_mode == "live"
-
-    def test_deque_copy_accepted(self):
-        c = _make_client(callback_snapshot_mode="deque_copy")
-        assert c.callback_snapshot_mode == "deque_copy"
-
-    def test_deep_copy_accepted(self):
-        c = _make_client(callback_snapshot_mode="deep_copy")
-        assert c.callback_snapshot_mode == "deep_copy"
+    @pytest.mark.parametrize("mode", ["live", "deque_copy", "deep_copy"])
+    def test_valid_mode_accepted(self, mode):
+        c = _make_client(callback_snapshot_mode=mode)
+        assert c.callback_snapshot_mode == mode
 
     def test_invalid_mode_raises(self):
         with patch("sk_zmq.client.zmq.Context") as context_factory:
@@ -198,11 +199,6 @@ class TestBuildCallbackPayload:
         c = self._loaded_client("live")
         payload = c._build_callback_payload()
         assert payload is c.candle_deques
-
-    def test_live_deques_are_same_objects(self):
-        c = self._loaded_client("live")
-        payload = c._build_callback_payload()
-        assert payload["1m"] is c.candle_deques["1m"]
 
     # -- deque_copy mode -----------------------------------------------------
 
@@ -385,14 +381,6 @@ class TestHandleCandleEventUpdate:
         _inject_update(c, "1m", dict(candle))
         assert not c.data_updated_event.is_set()
         assert list(c.candle_deques["1m"]) == [candle]
-
-    def test_update_does_not_set_event_when_zero_capacity_stores_nothing(self):
-        c = _make_client(intervals=["1m"], candle_deque_maxlen=0)
-
-        _inject_update(c, "1m", _make_candle(1))
-
-        assert list(c.candle_deques["1m"]) == []
-        assert not c.data_updated_event.is_set()
 
     def test_update_missing_candle_key_ignored(self):
         c = _make_client(intervals=["1m"])
@@ -870,15 +858,11 @@ def _noop_listener(client: ZMQClient) -> None:
     client.stop_event.wait()
 
 
-def _ready_listener_for(client: ZMQClient):
-    def listener(ready_event=None, run_event=None) -> None:
-        client._listener_start_result = ListenerStartResult(ListenerStartCode.READY)
-        if ready_event is not None:
-            ready_event.set()
-        if run_event is not None:
-            run_event.wait(timeout=1)
-
-    return listener
+def _ready_listener(ready_event=None, run_event=None, failed_event=None) -> None:
+    if ready_event is not None:
+        ready_event.set()
+    if run_event is not None:
+        run_event.wait(timeout=1)
 
 
 class _InvalidJsonThenStopSocket:
@@ -892,7 +876,10 @@ class _InvalidJsonThenStopSocket:
     def setsockopt_string(self, _option, _value):
         pass
 
-    def recv_multipart(self, flags=0):
+    def poll(self, _timeout):
+        return True
+
+    def recv_multipart(self):
         self.client.stop_event.set()
         return [b"UPBIT:CANDLE:KRW-BTC:1m:UPDATE", b"{"]
 
@@ -912,7 +899,10 @@ class _MalformedMultipartThenStopSocket:
     def setsockopt_string(self, _option, _value):
         pass
 
-    def recv_multipart(self, flags=0):
+    def poll(self, _timeout):
+        return True
+
+    def recv_multipart(self):
         self.client.stop_event.set()
         return self.frames
 
@@ -1126,7 +1116,7 @@ class TestLifecycleStartAndRenewal:
 
         with patch.object(client, "_send_request", side_effect=responses) as send_request, \
             patch.object(
-                client, "_data_listener_thread", side_effect=_ready_listener_for(client)
+                client, "_data_listener_thread", side_effect=_ready_listener
             ), \
             patch.object(client, "_strategy_trigger_thread", return_value=None), \
             patch.object(client, "_subscription_renewer_thread", return_value=None):
@@ -1153,13 +1143,33 @@ class TestLifecycleStartAndRenewal:
         ]
         assert len(client.threads) == 3
 
+    def test_start_caps_gateway_history_without_capping_local_storage(self):
+        client = _make_client(intervals=["1m"], candle_deque_maxlen=500)
+
+        with patch.object(
+            client, "_send_request", return_value=_request_ok([_make_candle(1)])
+        ) as send_request, patch.object(
+            client, "_data_listener_thread", side_effect=_ready_listener
+        ), patch.object(
+            client, "_strategy_trigger_thread", return_value=None
+        ), patch.object(
+            client, "_subscription_renewer_thread", return_value=None
+        ):
+            assert client.start() is True
+
+        for thread in client.threads:
+            thread.join(timeout=1)
+
+        assert send_request.call_args.args[0]["history_count"] == 200
+        assert client.candle_deques["1m"].maxlen == 500
+
     def test_start_refuses_second_lifecycle_transition(self):
         client = _make_client(intervals=["1m"])
 
         with patch.object(
             client, "_send_request", return_value=_request_ok([_make_candle(1)])
         ) as send_request, patch.object(
-            client, "_data_listener_thread", side_effect=_ready_listener_for(client)
+            client, "_data_listener_thread", side_effect=_ready_listener
         ), patch.object(
             client, "_strategy_trigger_thread", return_value=None
         ), patch.object(
@@ -1209,7 +1219,7 @@ class TestLifecycleStartAndRenewal:
 
         with patch.object(client, "_send_request", side_effect=responses), \
             patch.object(
-                client, "_data_listener_thread", side_effect=_ready_listener_for(client)
+                client, "_data_listener_thread", side_effect=_ready_listener
             ), \
             patch.object(client, "_strategy_trigger_thread", return_value=None), \
             patch.object(client, "_subscription_renewer_thread", return_value=None):
@@ -1327,12 +1337,10 @@ class TestLifecycleStartAndRenewal:
         client.context.socket.return_value = socket
         client.stop_event.set()
 
-        with patch("sk_zmq.client.time.sleep") as sleep:
-            result = client._send_request({"action": "subscribe_candle"})
+        result = client._send_request({"action": "subscribe_candle"})
 
         assert result.code is GatewayRequestCode.CANCELED
         assert socket.send.call_count == 1
-        assert sleep.call_count == 0
 
     def test_send_request_interrupts_retry_backoff_on_shutdown(self):
         client = _make_client(intervals=["1m"])
@@ -1342,8 +1350,7 @@ class TestLifecycleStartAndRenewal:
         stop_event = _StopOnWait()
         client.stop_event = stop_event
 
-        with patch("sk_zmq.client.time.sleep"):
-            result = client._send_request({"action": "subscribe_candle"})
+        result = client._send_request({"action": "subscribe_candle"})
 
         assert result.code is GatewayRequestCode.CANCELED
         assert socket.send.call_count == 1
@@ -1433,7 +1440,7 @@ class TestLifecycleStartAndRenewal:
 
         with patch.object(client, "_send_request", side_effect=send_request), \
             patch.object(
-                client, "_data_listener_thread", side_effect=_ready_listener_for(client)
+                client, "_data_listener_thread", side_effect=_ready_listener
             ), \
             patch.object(client, "_strategy_trigger_thread", return_value=None), \
             patch.object(client, "_subscription_renewer_thread", return_value=None):
@@ -1482,7 +1489,7 @@ class TestLifecycleStartAndRenewal:
         ), patch.object(
             client,
             "_data_listener_thread",
-            side_effect=_ready_listener_for(client),
+            side_effect=_ready_listener,
         ), patch.object(
             client,
             "_strategy_trigger_thread",

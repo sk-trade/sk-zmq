@@ -1,6 +1,5 @@
 import logging
 import threading
-import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -72,18 +71,6 @@ class ClientState(Enum):
     STOPPED = "stopped"
 
 
-class ListenerStartCode(Enum):
-    PENDING = "pending"
-    READY = "ready"
-    FAILED = "failed"
-
-
-@dataclass(frozen=True)
-class ListenerStartResult:
-    code: ListenerStartCode
-    cause: Optional[Exception] = None
-
-
 class ZMQClient:
     """
     ZMQ 게이트웨이와 통신하여 실시간 캔들 데이터를 수신하고 관리하는 클라이언트.
@@ -98,6 +85,8 @@ class ZMQClient:
     """
 
     _STOP_UNSUBSCRIBE_TIMEOUT_MS = 1000
+    _MAX_INITIAL_HISTORY_COUNT = 200
+    MAX_CONSECUTIVE_FAILURES = 3
 
     def __init__(
         self,
@@ -123,6 +112,7 @@ class ZMQClient:
             client_id (str): 게이트웨이에서 클라이언트를 식별하기 위한 고유 ID.
             symbol (str): 거래할 자산의 심볼 (예: "KRW-BTC").
             intervals (List[str]): 구독할 캔들의 시간 간격 리스트 (예: ["1m", "5m"]).
+                최소 하나의 지원 interval이 필요합니다.
             candle_handler_callback (Callable): 새로운 캔들 데이터가 수신될 때마다 호출될 콜백 함수.
                                                 이 함수는 `candle_deques` 딕셔너리를 인자로 받습니다.
             throttle_seconds (Optional[float]): 콜백 함수 호출을 제한하는 시간(초).
@@ -132,7 +122,7 @@ class ZMQClient:
             zmq_gateway_req_port (int): ZMQ REQ 포트.
             zmq_gateway_pub_port (int): ZMQ PUB 포트.
             server_candle_ttl (int): 서버 캔들 구독 TTL (초). 0보다 커야 하며 기본값은 300.
-            candle_deque_maxlen (int): 캔들 덱 최대 길이. 기본값 200.
+            candle_deque_maxlen (int): 캔들 덱 최대 길이. 0보다 커야 하며 기본값 200.
             on_critical (Optional[Callable[[str], None]]): 치명적 이벤트 시 호출될 콜백.
             callback_snapshot_mode (str): 콜백에 전달할 스냅샷 모드.
                 "live": 내부 deque를 그대로 전달
@@ -153,10 +143,16 @@ class ZMQClient:
         if server_candle_ttl <= 0:
             raise ValueError("server_candle_ttl must be greater than 0.")
         self.server_candle_ttl = server_candle_ttl
+        if candle_deque_maxlen <= 0:
+            raise ValueError("candle_deque_maxlen must be greater than 0.")
         self.candle_deque_maxlen = candle_deque_maxlen
         self.on_critical = on_critical
+        if callback_snapshot_mode not in {"live", "deque_copy", "deep_copy"}:
+            raise ValueError(
+                "Invalid callback_snapshot_mode. "
+                "Expected one of: live, deque_copy, deep_copy."
+            )
         self.callback_snapshot_mode = callback_snapshot_mode
-        self._validate_callback_snapshot_mode()
 
         self.stop_event = threading.Event()
         self.storage_lock = threading.Lock()
@@ -169,8 +165,6 @@ class ZMQClient:
         self._stop_complete_event = threading.Event()
 
         self.consecutive_renewal_failures = 0
-        self.MAX_CONSECUTIVE_FAILURES = 3
-        self._listener_start_result = ListenerStartResult(ListenerStartCode.PENDING)
 
         self.candle_deques: Dict[str, deque] = {
             interval: deque(maxlen=self.candle_deque_maxlen) for interval in self.intervals
@@ -180,7 +174,11 @@ class ZMQClient:
         # Allocate the external resource only after pure validation and state setup.
         self.context = zmq.Context()
 
-    def _validate_intervals(self, intervals: List[str]) -> List[str]:
+    @staticmethod
+    def _validate_intervals(intervals: List[str]) -> List[str]:
+        if not intervals:
+            raise ValueError("intervals must contain at least one supported interval.")
+
         allowed = {"1m", "3m", "5m", "10m", "30m", "1h", "4h", "1d"}
         validated: List[str] = []
         for interval in intervals:
@@ -192,14 +190,6 @@ class ZMQClient:
             validated.append(normalized)
         return validated
 
-    def _validate_callback_snapshot_mode(self) -> None:
-        valid_modes = {"live", "deque_copy", "deep_copy"}
-        if self.callback_snapshot_mode not in valid_modes:
-            raise ValueError(
-                "Invalid callback_snapshot_mode. "
-                "Expected one of: live, deque_copy, deep_copy."
-            )
-
     def _build_callback_payload(self) -> Dict[str, deque]:
         with self.storage_lock:
             if self.callback_snapshot_mode == "live":
@@ -209,9 +199,22 @@ class ZMQClient:
                     k: deque(v, maxlen=v.maxlen) for k, v in self.candle_deques.items()
                 }
             return {
-                k: deque([dict(c) for c in v], maxlen=v.maxlen)
+                k: deque((dict(c) for c in v), maxlen=v.maxlen)
                 for k, v in self.candle_deques.items()
             }
+
+    def _candle_request(
+        self, action: str, interval: str, *, history_count: Optional[int] = None
+    ) -> Dict[str, Any]:
+        request: Dict[str, Any] = {
+            "action": action,
+            "symbol": self.symbol,
+            "interval": interval,
+        }
+        if history_count is not None:
+            request["history_count"] = history_count
+        request["exchange"] = self.exchange
+        return request
 
     def _send_request(
         self,
@@ -402,13 +405,13 @@ class ZMQClient:
                     target_deque.append(event.candle)
                 updated = bool(target_deque)
             elif event.event_type is CandleEventType.CLOSE:
-                previous_candles = list(target_deque)
+                previous_candles = target_deque.copy()
                 if target_deque:
                     target_deque[-1] = event.candle
                 else:
                     target_deque.append(event.candle)
                 target_deque.append(event.new_candle)
-                updated = list(target_deque) != previous_candles
+                updated = target_deque != previous_candles
             elif event.event_type is CandleEventType.RECONCILE:
                 reconciled_ts = event.candle["ts"]
                 for i in range(len(target_deque) - 1, -1, -1):
@@ -429,6 +432,7 @@ class ZMQClient:
         self,
         ready_event: Optional[threading.Event] = None,
         run_event: Optional[threading.Event] = None,
+        failed_event: Optional[threading.Event] = None,
     ):
         """[스레드 타겟] ZMQ SUB 소켓을 통해 실시간 캔들 데이터를 구독하고 수신합니다."""
         socket_sub = None
@@ -444,15 +448,13 @@ class ZMQClient:
                     socket_sub.setsockopt_string(zmq.SUBSCRIBE, topic)
                     logger.debug(f"[{self.client_id}][SUB] 토픽 구독: '{topic}'")
             except Exception as e:
-                self._listener_start_result = ListenerStartResult(
-                    ListenerStartCode.FAILED, cause=e
-                )
                 logger.error(f"ZMQ SUB 리스너 초기화 중 오류 발생: {e}")
+                if failed_event is not None:
+                    failed_event.set()
                 if ready_event is not None:
                     ready_event.set()
                 return
 
-            self._listener_start_result = ListenerStartResult(ListenerStartCode.READY)
             if ready_event is not None:
                 ready_event.set()
 
@@ -463,7 +465,9 @@ class ZMQClient:
 
             while not self.stop_event.is_set():
                 try:
-                    frames = socket_sub.recv_multipart(flags=zmq.NOBLOCK)
+                    if not socket_sub.poll(10):
+                        continue
+                    frames = socket_sub.recv_multipart()
                     if not isinstance(frames, (list, tuple)) or len(frames) != 2:
                         logger.warning(f"잘못된 캔들 이벤트 프레임을 무시합니다: {frames!r}")
                         continue
@@ -471,7 +475,6 @@ class ZMQClient:
                     topic_str = topic_bytes.decode()
                     payload = orjson.loads(payload_bytes)
                 except zmq.Again:
-                    time.sleep(0.01)
                     continue
                 except (orjson.JSONDecodeError, UnicodeDecodeError, TypeError) as e:
                     logger.warning(f"잘못된 캔들 이벤트 페이로드를 무시합니다: {e}")
@@ -492,40 +495,31 @@ class ZMQClient:
         while not self.stop_event.wait(renew_interval):
             logger.debug("모든 캔들 구독 갱신을 시작합니다...")
 
-            all_renewals_succeeded = True
-            renewal_cycle_canceled = False
             last_failure_detail = None
 
             for interval in self.intervals:
-                request = {
-                    "action": "subscribe_candle",
-                    "symbol": self.symbol,
-                    "interval": interval,
-                    "history_count": 1,
-                    "exchange": self.exchange,
-                }
+                request = self._candle_request(
+                    "subscribe_candle", interval, history_count=1
+                )
                 with self._subscription_request_lock:
                     if self.stop_event.is_set():
-                        renewal_cycle_canceled = True
                         break
                     response = self._send_request(request)
 
                 if self.stop_event.is_set():
-                    renewal_cycle_canceled = True
                     break
 
                 if not response.ok:
-                    all_renewals_succeeded = False
                     last_failure_detail = self._format_request_failure(response)
                     logger.error(
                         f"❌ [{interval}] 구독 갱신에 최종 실패했습니다! "
                         f"오류: {last_failure_detail}"
                     )
 
-            if renewal_cycle_canceled or self.stop_event.is_set():
+            if self.stop_event.is_set():
                 break
 
-            if all_renewals_succeeded:
+            if last_failure_detail is None:
                 if self.consecutive_renewal_failures > 0:
                     logger.info(
                         "✅ 구독 갱신이 정상화되었습니다. (이전 연속 실패: "
@@ -561,24 +555,28 @@ class ZMQClient:
         [스레드 타겟] 데이터 업데이트 이벤트를 감지하여 전략 콜백 함수를 실행합니다.
         ...
         """
-        if self.throttle_seconds and self.throttle_seconds > 0:
-            while not self.stop_event.wait(self.throttle_seconds):
-                if self.data_updated_event.is_set():
-                    self.data_updated_event.clear()
-                    try:
-                        payload = self._build_callback_payload()
-                        self.candle_handler_callback(payload)
-                    except Exception as e:
-                        logger.error(f"전략 콜백 함수 실행 중 오류: {e}", exc_info=True)
-        else:
-            while not self.stop_event.is_set():
-                if self.data_updated_event.wait(timeout=1):
-                    self.data_updated_event.clear()
-                    try:
-                        payload = self._build_callback_payload()
-                        self.candle_handler_callback(payload)
-                    except Exception as e:
-                        logger.error(f"전략 콜백 함수 실행 중 오류: {e}", exc_info=True)
+        throttle_seconds = (
+            self.throttle_seconds
+            if self.throttle_seconds and self.throttle_seconds > 0
+            else None
+        )
+        while not self.stop_event.is_set():
+            if throttle_seconds is None:
+                updated = self.data_updated_event.wait(timeout=1)
+            else:
+                if self.stop_event.wait(throttle_seconds):
+                    break
+                updated = self.data_updated_event.is_set()
+
+            if not updated:
+                continue
+
+            self.data_updated_event.clear()
+            try:
+                payload = self._build_callback_payload()
+                self.candle_handler_callback(payload)
+            except Exception as e:
+                logger.error(f"전략 콜백 함수 실행 중 오류: {e}", exc_info=True)
 
         logger.debug(f"[{self.client_id}][TRIGGER] 전략 트리거 스레드 종료.")
 
@@ -612,13 +610,13 @@ class ZMQClient:
 
         initial_snapshots: Dict[str, list] = {}
         for interval in self.intervals:
-            req = {
-                "action": "subscribe_candle",
-                "symbol": self.symbol,
-                "interval": interval,
-                "history_count": self.candle_deque_maxlen,
-                "exchange": self.exchange,
-            }
+            req = self._candle_request(
+                "subscribe_candle",
+                interval,
+                history_count=min(
+                    self.candle_deque_maxlen, self._MAX_INITIAL_HISTORY_COUNT
+                ),
+            )
             with self._subscription_request_lock:
                 if self.stop_event.is_set():
                     return abort_start()
@@ -636,10 +634,10 @@ class ZMQClient:
 
         listener_ready = threading.Event()
         listener_run = threading.Event()
-        self._listener_start_result = ListenerStartResult(ListenerStartCode.PENDING)
+        listener_failed = threading.Event()
         listener = threading.Thread(
             target=self._data_listener_thread,
-            args=(listener_ready, listener_run),
+            args=(listener_ready, listener_run, listener_failed),
             name="ZMQListener",
         )
         try:
@@ -649,7 +647,7 @@ class ZMQClient:
             return abort_start()
         listener_ready.wait()
 
-        if self._listener_start_result.code is not ListenerStartCode.READY:
+        if listener_failed.is_set():
             listener.join(timeout=1)
             logger.error(
                 "ZMQ SUB 리스너를 초기화하지 못해 클라이언트를 시작할 수 없습니다."
@@ -736,12 +734,7 @@ class ZMQClient:
                     logger.debug(f"[{interval}] 구독 해지 요청 중...")
                     try:
                         self._send_request(
-                            {
-                                "action": "unsubscribe_candle",
-                                "symbol": self.symbol,
-                                "interval": interval,
-                                "exchange": self.exchange,
-                            },
+                            self._candle_request("unsubscribe_candle", interval),
                             max_retries=1,
                             receive_timeout_ms=self._STOP_UNSUBSCRIBE_TIMEOUT_MS,
                         )

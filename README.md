@@ -24,6 +24,11 @@ A compatible candle gateway must already be running at the configured host and
 ports. `start()` returns `False` if an initial snapshot cannot be loaded or the
 local SUB listener cannot be initialized.
 
+Construction fails immediately if `intervals` is empty or
+`candle_deque_maxlen` is not greater than zero.
+`candle_deque_maxlen` may exceed 200; initial gateway history is capped at 200
+while the local deque continues growing up to the configured maximum.
+
 ```python
 import time
 
