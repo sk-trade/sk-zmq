@@ -1143,6 +1143,26 @@ class TestLifecycleStartAndRenewal:
         ]
         assert len(client.threads) == 3
 
+    def test_start_caps_gateway_history_without_capping_local_storage(self):
+        client = _make_client(intervals=["1m"], candle_deque_maxlen=500)
+
+        with patch.object(
+            client, "_send_request", return_value=_request_ok([_make_candle(1)])
+        ) as send_request, patch.object(
+            client, "_data_listener_thread", side_effect=_ready_listener
+        ), patch.object(
+            client, "_strategy_trigger_thread", return_value=None
+        ), patch.object(
+            client, "_subscription_renewer_thread", return_value=None
+        ):
+            assert client.start() is True
+
+        for thread in client.threads:
+            thread.join(timeout=1)
+
+        assert send_request.call_args.args[0]["history_count"] == 200
+        assert client.candle_deques["1m"].maxlen == 500
+
     def test_start_refuses_second_lifecycle_transition(self):
         client = _make_client(intervals=["1m"])
 

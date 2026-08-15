@@ -85,6 +85,7 @@ class ZMQClient:
     """
 
     _STOP_UNSUBSCRIBE_TIMEOUT_MS = 1000
+    _MAX_INITIAL_HISTORY_COUNT = 200
     MAX_CONSECUTIVE_FAILURES = 3
 
     def __init__(
@@ -612,7 +613,9 @@ class ZMQClient:
             req = self._candle_request(
                 "subscribe_candle",
                 interval,
-                history_count=self.candle_deque_maxlen,
+                history_count=min(
+                    self.candle_deque_maxlen, self._MAX_INITIAL_HISTORY_COUNT
+                ),
             )
             with self._subscription_request_lock:
                 if self.stop_event.is_set():
