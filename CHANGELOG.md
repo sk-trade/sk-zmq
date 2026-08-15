@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.5] - 2026-08-15
+
+### Changed
+
+- Simplified listener, renewal, callback, and shutdown lifecycle handling while preserving the public client contract.
+- Allow local candle deques larger than 200 while limiting initial gateway history requests to the broadcaster's 200-candle maximum.
+
+### Fixed
+
+- Reject empty interval lists and non-positive candle deque capacities before allocating ZMQ resources.
+
 ## [0.1.4] - 2026-07-19
 
 ### Changed
