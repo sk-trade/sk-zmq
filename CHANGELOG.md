@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.2.0] - 2026-10-14
+
+### Changed
+
+- Support aggregated intervals 1m, 3m, 5m, 15m, 30m, 1h, 4h; remove legacy 10m/1d.
+- Start SUB reception before snapshots and merge buffered candle events by timestamp.
+- Recover from RESYNC_REQUIRED and transport reconnects using fresh snapshots;
+  retry failed or invalidated snapshots with bounded event buffering.
+- Ignore late UPDATE/CLOSE buckets and decreasing same-bucket volume while
+  preserving authoritative RECONCILE corrections, callback modes, TTL renewal,
+  and serialized cleanup.
+- Consolidate tests around candle integrity, real socket handoff/reconnection,
+  callbacks, renewal and shutdown races; remove redundant declaration/copy/log checks.
+
 ## [0.1.5] - 2026-08-15
 
 ### Changed

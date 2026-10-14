@@ -1,5 +1,6 @@
 import logging
 import threading
+
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -7,6 +8,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 
 import orjson
 import zmq
+from zmq.utils.monitor import recv_monitor_message
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +89,7 @@ class ZMQClient:
     _STOP_UNSUBSCRIBE_TIMEOUT_MS = 1000
     _MAX_INITIAL_HISTORY_COUNT = 200
     MAX_CONSECUTIVE_FAILURES = 3
+    _MAX_PENDING_EVENTS = 10000
 
     def __init__(
         self,
@@ -164,10 +167,17 @@ class ZMQClient:
         self._startup_complete_event.set()
         self._stop_complete_event = threading.Event()
 
+        self._transport_connected = threading.Event()
+        self._resync_event = threading.Event()
+        self._pending_events: Dict[str, List[CandleEvent]] = {}
+        self._resync_generation = 0
+        self._listener_cancel = threading.Event()
+
         self.consecutive_renewal_failures = 0
 
         self.candle_deques: Dict[str, deque] = {
-            interval: deque(maxlen=self.candle_deque_maxlen) for interval in self.intervals
+            interval: deque(maxlen=self.candle_deque_maxlen)
+            for interval in self.intervals
         }
         self.threads: List[threading.Thread] = []
 
@@ -179,16 +189,16 @@ class ZMQClient:
         if not intervals:
             raise ValueError("intervals must contain at least one supported interval.")
 
-        allowed = {"1m", "3m", "5m", "10m", "30m", "1h", "4h", "1d"}
+        allowed = {"1m", "3m", "5m", "15m", "30m", "1h", "4h"}
         validated: List[str] = []
         for interval in intervals:
             normalized = interval.strip()
             if normalized not in allowed:
                 raise ValueError(
-                    "Invalid interval. Expected one of: 1m, 3m, 5m, 10m, 30m, 1h, 4h, 1d."
+                    "Invalid interval. Expected one of: 1m, 3m, 5m, 15m, 30m, 1h, 4h."
                 )
             validated.append(normalized)
-        return validated
+        return list(dict.fromkeys(validated))
 
     def _build_callback_payload(self) -> Dict[str, deque]:
         with self.storage_lock:
@@ -317,14 +327,17 @@ class ZMQClient:
     ) -> Optional[List[Dict[str, Any]]]:
         if not result.ok or not isinstance(result.data, list) or not result.data:
             return None
-        if not all(isinstance(candle, dict) for candle in result.data):
+        if not all(ZMQClient._valid_candle(candle) for candle in result.data):
             return None
-        return result.data
+        return sorted({c["ts"]: c for c in result.data}.values(), key=lambda c: c["ts"])
 
     @staticmethod
     def _format_request_failure(result: GatewayRequestResult) -> str:
         detail = result.code.value
-        if result.code is not GatewayRequestCode.GATEWAY_REJECTED or not result.response:
+        if (
+            result.code is not GatewayRequestCode.GATEWAY_REJECTED
+            or not result.response
+        ):
             return detail
 
         message = result.response.get("message")
@@ -356,15 +369,13 @@ class ZMQClient:
             return None
 
         candle = payload.get("candle")
-        if not isinstance(candle, dict):
-            return None
-        if event_type is CandleEventType.RECONCILE and candle.get("ts") is None:
+        if not self._valid_candle(candle):
             return None
 
         new_candle = None
         if event_type is CandleEventType.CLOSE:
             candidate = payload.get("new")
-            if not isinstance(candidate, dict):
+            if not self._valid_candle(candidate) or candidate["ts"] <= candle["ts"]:
                 return None
             new_candle = candidate
 
@@ -375,70 +386,145 @@ class ZMQClient:
             new_candle=new_candle,
         )
 
+    @staticmethod
+    def _valid_candle(candle: object) -> bool:
+        return (
+            isinstance(candle, dict)
+            and isinstance(candle.get("ts"), int)
+            and not isinstance(candle["ts"], bool)
+            and candle["ts"] >= 0
+            and isinstance(candle.get("volume", 0), (int, float))
+            and candle.get("volume", 0) >= 0
+        )
+
+    def _request_resync(self, intervals: Optional[List[str]] = None) -> None:
+        with self.storage_lock:
+            self._resync_generation += 1
+            for interval in intervals or self.intervals:
+                self._pending_events.setdefault(interval, [])
+            self._resync_event.set()
+
+    def _apply_candle_event_locked(self, event: CandleEvent) -> bool:
+        candles = self.candle_deques[event.interval]
+        before = list(candles)
+        if event.event_type is CandleEventType.RECONCILE:
+            for i in range(len(candles) - 1, -1, -1):
+                if candles[i]["ts"] == event.candle["ts"]:
+                    candles[i] = event.candle
+                    break
+        else:
+            # Late UPDATE/CLOSE cannot overwrite a newer bucket or finalized history.
+            for candle in (event.candle, event.new_candle):
+                if candle is None:
+                    continue
+                if not candles or candle["ts"] > candles[-1]["ts"]:
+                    candles.append(candle)
+                elif candle["ts"] == candles[-1]["ts"]:
+                    if candle.get("volume", 0) >= candles[-1].get("volume", 0):
+                        candles[-1] = candle
+        return list(candles) != before
+
     def _handle_candle_event(self, topic_str: str, payload: dict):
-        """
-        수신된 캔들 이벤트를 파싱하고 내부 데이터 저장소(`candle_deques`)를 업데이트합니다.
-
-        이벤트 유형:
-        - UPDATE: 현재 진행 중인 캔들의 정보 (시가, 고가, 저가, 종가)가 업데이트됨.
-        - CLOSE: 캔들이 마감되고 새로운 캔들이 시작됨.
-        - RECONCILE: 거래소의 최종 데이터와 불일치가 있을 경우, 과거 캔들 데이터가 보정됨.
-
-        Args:
-            topic_str (str): 이벤트가 발생한 ZMQ 토픽 문자열.
-            payload (dict): 이벤트와 관련된 데이터.
-        """
+        prefix = f"{self.exchange_prefix}:CANDLE:{self.symbol}:"
+        if (
+            isinstance(payload, dict)
+            and topic_str.startswith(prefix)
+            and topic_str.endswith(":RESYNC_REQUIRED")
+            and len(topic_str.split(":")) == 5
+        ):
+            interval = topic_str[len(prefix) :].split(":")[0]
+            if interval in self.candle_deques:
+                self._request_resync([interval])
+            return
         event = self._parse_candle_event(topic_str, payload)
         if event is None:
             return
-
-        target_deque = self.candle_deques[event.interval]
-        updated = False
-
         with self.storage_lock:
-            if event.event_type is CandleEventType.UPDATE:
-                if target_deque:
-                    if target_deque[-1] == event.candle:
-                        return
-                    target_deque[-1] = event.candle
-                else:
-                    target_deque.append(event.candle)
-                updated = bool(target_deque)
-            elif event.event_type is CandleEventType.CLOSE:
-                previous_candles = target_deque.copy()
-                if target_deque:
-                    target_deque[-1] = event.candle
-                else:
-                    target_deque.append(event.candle)
-                target_deque.append(event.new_candle)
-                updated = target_deque != previous_candles
-            elif event.event_type is CandleEventType.RECONCILE:
-                reconciled_ts = event.candle["ts"]
-                for i in range(len(target_deque) - 1, -1, -1):
-                    if target_deque[i].get("ts") == reconciled_ts:
-                        if target_deque[i] == event.candle:
-                            break
-                        logger.debug(
-                            f"[{event.interval}] 캔들 데이터 보정 발생! ts:{reconciled_ts}"
-                        )
-                        target_deque[i] = event.candle
-                        updated = True
-                        break
+            pending = self._pending_events.get(event.interval)
+            if pending is not None:
+                if len(pending) >= self._MAX_PENDING_EVENTS:
+                    pending.clear()
+                    self._resync_generation += 1
+                    self._resync_event.set()
+                pending.append(event)
+                return
+            if self._apply_candle_event_locked(event):
+                self.data_updated_event.set()
 
-        if updated:
-            self.data_updated_event.set()
+    def _load_snapshots(self) -> bool:
+        with self.storage_lock:
+            intervals = list(self._pending_events)
+            generation = self._resync_generation
+        snapshots = {}
+        for interval in intervals:
+            with self._subscription_request_lock:
+                if self.stop_event.is_set():
+                    return False
+                result = self._send_request(
+                    self._candle_request(
+                        "subscribe_candle",
+                        interval,
+                        history_count=min(
+                            self.candle_deque_maxlen, self._MAX_INITIAL_HISTORY_COUNT
+                        ),
+                    )
+                )
+            snapshot = self._snapshot_from_result(result)
+            if snapshot is None:
+                return False
+            snapshots[interval] = snapshot
+        with self.storage_lock:
+            if self.stop_event.is_set() or generation != self._resync_generation:
+                return False
+            changed = False
+            for interval, snapshot in snapshots.items():
+                candles = self.candle_deques[interval]
+                before = list(candles)
+                newer = [c for c in candles if c["ts"] > snapshot[-1]["ts"]]
+                candles.clear()
+                candles.extend(snapshot)
+                candles.extend(newer)
+                for event in self._pending_events.pop(interval):
+                    self._apply_candle_event_locked(event)
+                changed |= list(candles) != before
+            self._resync_event.clear()
+            if changed:
+                self.data_updated_event.set()
+        return True
+
+    def _recovery_thread(self):
+        while not self.stop_event.is_set():
+            if not self._transport_connected.wait(0.1):
+                continue
+            if not self._resync_event.wait(0.1):
+                continue
+            if not self._load_snapshots():
+                logger.error(
+                    "Candle recovery snapshot failed; retrying with live events buffered."
+                )
+                if self.on_critical:
+                    try:
+                        self.on_critical(
+                            "Candle recovery snapshot failed; data is not ready."
+                        )
+                    except Exception:
+                        logger.exception("Critical callback failed")
+                self.stop_event.wait(1)
 
     def _data_listener_thread(
         self,
         ready_event: Optional[threading.Event] = None,
-        run_event: Optional[threading.Event] = None,
         failed_event: Optional[threading.Event] = None,
     ):
         """[스레드 타겟] ZMQ SUB 소켓을 통해 실시간 캔들 데이터를 구독하고 수신합니다."""
         socket_sub = None
+        monitor = None
         try:
             try:
                 socket_sub = self.context.socket(zmq.SUB)
+                monitor = socket_sub.get_monitor_socket(
+                    events=zmq.EVENT_CONNECTED | zmq.EVENT_DISCONNECTED
+                )
                 socket_sub.connect(
                     f"tcp://{self.zmq_gateway_host}:{self.zmq_gateway_pub_port}"
                 )
@@ -458,18 +544,22 @@ class ZMQClient:
             if ready_event is not None:
                 ready_event.set()
 
-            if run_event is not None:
-                while not run_event.wait(timeout=0.1):
-                    if self.stop_event.is_set():
-                        return
-
-            while not self.stop_event.is_set():
+            while not self.stop_event.is_set() and not self._listener_cancel.is_set():
                 try:
+                    if monitor.poll(0):
+                        connection = recv_monitor_message(monitor)
+                        if connection["event"] == zmq.EVENT_DISCONNECTED:
+                            self._transport_connected.clear()
+                            self._request_resync()
+                        elif connection["event"] == zmq.EVENT_CONNECTED:
+                            self._transport_connected.set()
                     if not socket_sub.poll(10):
                         continue
                     frames = socket_sub.recv_multipart()
                     if not isinstance(frames, (list, tuple)) or len(frames) != 2:
-                        logger.warning(f"잘못된 캔들 이벤트 프레임을 무시합니다: {frames!r}")
+                        logger.warning(
+                            f"잘못된 캔들 이벤트 프레임을 무시합니다: {frames!r}"
+                        )
                         continue
                     topic_bytes, payload_bytes = frames
                     topic_str = topic_bytes.decode()
@@ -481,6 +571,8 @@ class ZMQClient:
                     continue
                 self._handle_candle_event(topic_str, payload)
         finally:
+            if monitor is not None:
+                monitor.close(linger=0)
             if socket_sub is not None:
                 try:
                     socket_sub.close()
@@ -572,6 +664,9 @@ class ZMQClient:
                 continue
 
             self.data_updated_event.clear()
+            with self.storage_lock:
+                if self._pending_events:
+                    continue
             try:
                 payload = self._build_callback_payload()
                 self.candle_handler_callback(payload)
@@ -580,12 +675,17 @@ class ZMQClient:
 
         logger.debug(f"[{self.client_id}][TRIGGER] 전략 트리거 스레드 종료.")
 
+    def _run_worker(self, worker):
+        self._startup_complete_event.wait()
+        if not self.stop_event.is_set():
+            worker()
+
     def start(self) -> bool:
         """
         클라이언트를 시작합니다.
 
-        초기 캔들 데이터(스냅샷)를 요청하고, 성공적으로 수신하면
-        데이터 수신, 구독 갱신, 전략 실행을 위한 백그라운드 스레드를 시작합니다.
+        SUB 리스너를 먼저 시작하고 스냅샷 로딩 중 이벤트를 버퍼링합니다.
+        스냅샷 병합이 완료되면 구독 갱신, 복구, 콜백 스레드를 시작합니다.
 
         Returns:
             bool: 초기화 및 스레드 시작에 성공하면 True, 실패하면 False.
@@ -603,41 +703,24 @@ class ZMQClient:
             return False
 
         def abort_start() -> bool:
+            with self.storage_lock:
+                self._pending_events.clear()
+                self._resync_event.clear()
+                for candles in self.candle_deques.values():
+                    candles.clear()
             with self._lifecycle_lock:
                 return abort_start_locked()
 
         logger.info("ZMQ 게이트웨이에 연결 및 스냅샷 요청을 시작합니다...")
 
-        initial_snapshots: Dict[str, list] = {}
-        for interval in self.intervals:
-            req = self._candle_request(
-                "subscribe_candle",
-                interval,
-                history_count=min(
-                    self.candle_deque_maxlen, self._MAX_INITIAL_HISTORY_COUNT
-                ),
-            )
-            with self._subscription_request_lock:
-                if self.stop_event.is_set():
-                    return abort_start()
-                response = self._send_request(req)
-
-            if self.stop_event.is_set():
-                return abort_start()
-
-            snapshot = self._snapshot_from_result(response)
-            if snapshot is None:
-                logger.error(f"❌ [{interval}] 스냅샷 수신 실패. 클라이언트를 시작할 수 없습니다.")
-                return abort_start()
-            initial_snapshots[interval] = snapshot
-            logger.debug(f"✅ [{interval}] 스냅샷 수신 성공 ({len(snapshot)}개).")
+        self._listener_cancel.clear()
+        self._request_resync()
 
         listener_ready = threading.Event()
-        listener_run = threading.Event()
         listener_failed = threading.Event()
         listener = threading.Thread(
             target=self._data_listener_thread,
-            args=(listener_ready, listener_run, listener_failed),
+            args=(listener_ready, listener_failed),
             name="ZMQListener",
         )
         try:
@@ -657,22 +740,34 @@ class ZMQClient:
         prepared_threads = [listener]
 
         def rollback_prepared_threads() -> None:
-            listener_run.set()
+            self._listener_cancel.set()
+            self._startup_complete_event.set()
             current_thread = threading.current_thread()
             for thread in prepared_threads:
                 if thread is not current_thread and thread.is_alive():
                     thread.join(timeout=5)
 
+        if not self._load_snapshots():
+            rollback_prepared_threads()
+            return abort_start()
+
         try:
             renewer = threading.Thread(
-                target=self._subscription_renewer_thread,
+                target=self._run_worker,
+                args=(self._subscription_renewer_thread,),
                 name="SubscriptionRenewer",
             )
             trigger = threading.Thread(
-                target=self._strategy_trigger_thread,
+                target=self._run_worker,
+                args=(self._strategy_trigger_thread,),
                 name="StrategyTrigger",
             )
-            for thread in (renewer, trigger):
+            recovery = threading.Thread(
+                target=self._run_worker,
+                args=(self._recovery_thread,),
+                name="CandleRecovery",
+            )
+            for thread in (renewer, trigger, recovery):
                 if self.stop_event.is_set():
                     rollback_prepared_threads()
                     return abort_start()
@@ -691,13 +786,9 @@ class ZMQClient:
                 if self._state is not ClientState.STARTING or self.stop_event.is_set():
                     startup_canceled = True
                 else:
-                    for interval, snapshot in initial_snapshots.items():
-                        self.candle_deques[interval].extend(snapshot)
-
                     self.threads.extend(prepared_threads)
                     self._state = ClientState.RUNNING
                     self._startup_complete_event.set()
-                    listener_run.set()
 
         if startup_canceled:
             rollback_prepared_threads()
