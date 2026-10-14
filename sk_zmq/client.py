@@ -54,13 +54,16 @@ class CandleEventType(Enum):
     UPDATE = "UPDATE"
     CLOSE = "CLOSE"
     RECONCILE = "RECONCILE"
+    RESYNC_REQUIRED = "RESYNC_REQUIRED"
 
 
 @dataclass(frozen=True)
 class CandleEvent:
     interval: str
     event_type: CandleEventType
-    candle: Dict[str, Any]
+    stream_id: str
+    seq: int
+    candle: Optional[Dict[str, Any]] = None
     new_candle: Optional[Dict[str, Any]] = None
 
 
@@ -170,6 +173,9 @@ class ZMQClient:
         self._transport_connected = threading.Event()
         self._resync_event = threading.Event()
         self._pending_events: Dict[str, List[CandleEvent]] = {}
+        self._stream_state: Dict[str, tuple[str, int]] = {}
+        self._requested_stream_id: Optional[str] = None
+        self._retired_stream_ids = set()
         self._resync_generation = 0
         self._listener_cancel = threading.Event()
 
@@ -363,13 +369,18 @@ class ZMQClient:
         if interval not in self.candle_deques or not isinstance(payload, dict):
             return None
 
+        if not self._valid_ordering(payload, "seq"):
+            return None
+
         try:
             event_type = CandleEventType(event_type_value)
         except ValueError:
             return None
 
         candle = payload.get("candle")
-        if not self._valid_candle(candle):
+        if event_type is not CandleEventType.RESYNC_REQUIRED and not self._valid_candle(
+            candle
+        ):
             return None
 
         new_candle = None
@@ -382,6 +393,8 @@ class ZMQClient:
         return CandleEvent(
             interval=interval,
             event_type=event_type,
+            stream_id=payload["stream_id"],
+            seq=payload["seq"],
             candle=candle,
             new_candle=new_candle,
         )
@@ -397,49 +410,61 @@ class ZMQClient:
             and candle.get("volume", 0) >= 0
         )
 
+    @staticmethod
+    def _valid_ordering(payload, sequence_key):
+        return (
+            isinstance(payload, Mapping)
+            and isinstance(payload.get("stream_id"), str)
+            and bool(payload["stream_id"])
+            and isinstance(payload.get(sequence_key), int)
+            and not isinstance(payload[sequence_key], bool)
+            and payload[sequence_key] >= 0
+        )
+
+    def _request_resync_locked(self, intervals=None, stream_id=None):
+        self._resync_generation += 1
+        if stream_id is not None:
+            self._requested_stream_id = stream_id
+        for interval in intervals or self.intervals:
+            self._pending_events.setdefault(interval, [])
+        self._resync_event.set()
+
     def _request_resync(self, intervals: Optional[List[str]] = None) -> None:
         with self.storage_lock:
-            self._resync_generation += 1
-            for interval in intervals or self.intervals:
-                self._pending_events.setdefault(interval, [])
-            self._resync_event.set()
+            self._request_resync_locked(intervals)
 
     def _apply_candle_event_locked(self, event: CandleEvent) -> bool:
         candles = self.candle_deques[event.interval]
         before = list(candles)
-        if event.event_type is CandleEventType.RECONCILE:
-            for i in range(len(candles) - 1, -1, -1):
-                if candles[i]["ts"] == event.candle["ts"]:
-                    candles[i] = event.candle
-                    break
-        else:
-            # Late UPDATE/CLOSE cannot overwrite a newer bucket or finalized history.
-            for candle in (event.candle, event.new_candle):
-                if candle is None:
-                    continue
-                if not candles or candle["ts"] > candles[-1]["ts"]:
-                    candles.append(candle)
-                elif candle["ts"] == candles[-1]["ts"]:
-                    if candle.get("volume", 0) >= candles[-1].get("volume", 0):
-                        candles[-1] = candle
+        rows = {candle["ts"]: candle for candle in candles}
+        if (
+            event.event_type is not CandleEventType.RECONCILE
+            or event.candle["ts"] in rows
+        ):
+            rows[event.candle["ts"]] = event.candle
+        if event.new_candle is not None:
+            rows[event.new_candle["ts"]] = event.new_candle
+        candles.clear()
+        candles.extend(sorted(rows.values(), key=lambda candle: candle["ts"]))
         return list(candles) != before
 
     def _handle_candle_event(self, topic_str: str, payload: dict):
-        prefix = f"{self.exchange_prefix}:CANDLE:{self.symbol}:"
-        if (
-            isinstance(payload, dict)
-            and topic_str.startswith(prefix)
-            and topic_str.endswith(":RESYNC_REQUIRED")
-            and len(topic_str.split(":")) == 5
-        ):
-            interval = topic_str[len(prefix) :].split(":")[0]
-            if interval in self.candle_deques:
-                self._request_resync([interval])
-            return
         event = self._parse_candle_event(topic_str, payload)
         if event is None:
             return
         with self.storage_lock:
+            if event.stream_id in self._retired_stream_ids:
+                return
+            state = self._stream_state.get(event.interval)
+            if state is not None:
+                stream_id, seq = state
+                if event.stream_id == stream_id and event.seq <= seq:
+                    return
+                if (
+                    event.stream_id != stream_id
+                    and event.stream_id != self._requested_stream_id
+                ):
+                    self._request_resync_locked(stream_id=event.stream_id)
             pending = self._pending_events.get(event.interval)
             if pending is not None:
                 if len(pending) >= self._MAX_PENDING_EVENTS:
@@ -448,7 +473,10 @@ class ZMQClient:
                     self._resync_event.set()
                 pending.append(event)
                 return
-            if self._apply_candle_event_locked(event):
+            self._stream_state[event.interval] = (event.stream_id, event.seq)
+            if event.event_type is CandleEventType.RESYNC_REQUIRED:
+                self._request_resync_locked([event.interval])
+            elif self._apply_candle_event_locked(event):
                 self.data_updated_event.set()
 
     def _load_snapshots(self) -> bool:
@@ -470,23 +498,73 @@ class ZMQClient:
                     )
                 )
             snapshot = self._snapshot_from_result(result)
-            if snapshot is None:
+            if snapshot is None or not self._valid_ordering(
+                result.response, "snapshot_seq"
+            ):
                 return False
-            snapshots[interval] = snapshot
+            snapshots[interval] = (
+                snapshot,
+                result.response["stream_id"],
+                result.response["snapshot_seq"],
+            )
         with self.storage_lock:
             if self.stop_event.is_set() or generation != self._resync_generation:
                 return False
+            # Validate every interval before publishing any part of the recovery.
+            runtimes = {stream_id for _, stream_id, _ in snapshots.values()}
+            if len(runtimes) != 1:
+                return False
+            snapshot_stream_id = next(iter(runtimes))
+            if set(intervals) != set(self.intervals) and any(
+                state[0] != snapshot_stream_id for state in self._stream_state.values()
+            ):
+                self._request_resync_locked(stream_id=snapshot_stream_id)
+                return False
+            for interval, (_, stream_id, watermark) in snapshots.items():
+                state = self._stream_state.get(interval)
+                if (
+                    stream_id in self._retired_stream_ids
+                    or (
+                        self._requested_stream_id is not None
+                        and stream_id != self._requested_stream_id
+                    )
+                    or (
+                        state is not None
+                        and state[0] == stream_id
+                        and watermark < state[1]
+                    )
+                ):
+                    return False
+                if any(
+                    event.stream_id == stream_id
+                    and event.seq > watermark
+                    and event.event_type is CandleEventType.RESYNC_REQUIRED
+                    for event in self._pending_events[interval]
+                ):
+                    return False
             changed = False
-            for interval, snapshot in snapshots.items():
+            for interval, (snapshot, stream_id, watermark) in snapshots.items():
+                state = self._stream_state.get(interval)
+                if state is not None and state[0] != stream_id:
+                    self._retired_stream_ids.add(state[0])
                 candles = self.candle_deques[interval]
                 before = list(candles)
-                newer = [c for c in candles if c["ts"] > snapshot[-1]["ts"]]
                 candles.clear()
                 candles.extend(snapshot)
-                candles.extend(newer)
-                for event in self._pending_events.pop(interval):
-                    self._apply_candle_event_locked(event)
+                for event in sorted(
+                    (
+                        event
+                        for event in self._pending_events.pop(interval)
+                        if event.stream_id == stream_id and event.seq > watermark
+                    ),
+                    key=lambda event: event.seq,
+                ):
+                    if event.seq > watermark:
+                        self._apply_candle_event_locked(event)
+                        watermark = event.seq
+                self._stream_state[interval] = (stream_id, watermark)
                 changed |= list(candles) != before
+            self._requested_stream_id = None
             self._resync_event.clear()
             if changed:
                 self.data_updated_event.set()
@@ -601,6 +679,23 @@ class ZMQClient:
                 if self.stop_event.is_set():
                     break
 
+                if response.ok:
+                    if not self._valid_ordering(response.response, "snapshot_seq"):
+                        response = GatewayRequestResult.failure(
+                            GatewayRequestCode.INVALID_RESPONSE
+                        )
+                    else:
+                        with self.storage_lock:
+                            stream_id = response.response["stream_id"]
+                            state = self._stream_state.get(interval)
+                            if (
+                                state is not None
+                                and state[0] != stream_id
+                                and stream_id not in self._retired_stream_ids
+                                and stream_id != self._requested_stream_id
+                            ):
+                                self._request_resync_locked(stream_id=stream_id)
+
                 if not response.ok:
                     last_failure_detail = self._format_request_failure(response)
                     logger.error(
@@ -705,6 +800,8 @@ class ZMQClient:
         def abort_start() -> bool:
             with self.storage_lock:
                 self._pending_events.clear()
+                self._stream_state.clear()
+                self._requested_stream_id = None
                 self._resync_event.clear()
                 for candles in self.candle_deques.values():
                     candles.clear()

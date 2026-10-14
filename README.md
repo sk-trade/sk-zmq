@@ -1,6 +1,6 @@
 # sk-zmq
 
-Reusable ZMQ client for aggregated candle stream subscriptions (version 0.2.0).
+Reusable ZMQ client for aggregated candle stream subscriptions (version 0.2.1).
 
 This package provides only ZMQ communication, TTL renewal, and event listening.
 It does not include any trading logic.
@@ -98,23 +98,34 @@ REST daily/week/month candles remain separate provider-native capabilities.
 
 The gateway publishes `UPDATE`, `CLOSE`, and `RECONCILE` envelopes with `candle`
 (and `new` for CLOSE). Candle `ts` is the bucket open time in epoch milliseconds.
-UPDATE replaces the current bucket or appends a newer bucket. CLOSE completes
-the current bucket and appends the next bucket without duplicates. Late
-UPDATE/CLOSE messages cannot replace newer buckets or reduce same-bucket volume.
-RECONCILE authoritatively replaces a stored timestamp, including volume reductions;
-a missing timestamp is ignored. Unknown and malformed events are ignored.
+Every event, including `RESYNC_REQUIRED`, carries `stream_id` (provider runtime
+identity) and `seq` (monotonically increasing provider publication counter).
+Candle rows are upserted by `ts` and kept sorted; CLOSE does not duplicate a bucket
+or replace a different newer bucket. Freshness is determined by sequence, so later
+same-bucket events can change price at equal volume or reduce volume. RECONCILE
+replaces a stored timestamp; a missing timestamp is ignored. Unknown, malformed,
+unsequenced, duplicate and stale events are ignored.
 
 ## Startup, recovery, and leases
 
 `start()` prepares and runs the SUB listener before requesting snapshots for all
-intervals. Events received during snapshot requests are buffered and merged by
-candle timestamp. Snapshot history is sorted and deduplicated. Callback and
+intervals. Successful `subscribe_candle` responses must carry `stream_id` and
+`snapshot_seq`, captured atomically with the candle data by the gateway. The client
+installs that history and boundary, then replays only matching-runtime buffered
+events with `seq > snapshot_seq`, in ascending sequence order. Same-runtime
+sequences already applied or covered by the snapshot are discarded. Counters are
+provider-wide, so sequence gaps between this client's intervals are normal.
+Snapshot history is sorted and deduplicated. Callback and
 renewal workers begin only after startup succeeds. A failed startup stops the
 listener and leaves no partial history; call `stop()` in `finally` to release
 leases and the context, as in the example above.
 
-An interval's `RESYNC_REQUIRED` event or a SUB transport disconnect pauses
-callback delivery while live events are buffered. After reconnect, the client
+An interval's fresh `RESYNC_REQUIRED` event or a SUB transport disconnect pauses
+callback delivery while live events are buffered. A different `stream_id` in live
+events or renewal responses requires fresh snapshots for all intervals; counters
+from separate runtimes are never compared. Events from a replaced runtime are
+ignored. A restart discovered during an interval recovery expands recovery to all
+intervals before publishing any new state. After reconnect, the client
 reloads snapshots and merges buffered events before resuming callbacks. Recovery
 requests use the same exchange, symbol, and interval as the original lease.
 Failed recovery requests retain stored data and retry; `on_critical` reports
@@ -122,7 +133,10 @@ failed recovery attempts. Storage read directly during recovery is the last
 known state. Each interval buffers at most 10,000 events; overflow invalidates
 the in-flight snapshot and requires another snapshot instead of silently
 accepting incomplete history. A further recovery notice also invalidates an
-in-flight snapshot.
+in-flight snapshot when it is not covered by the snapshot boundary. Missing
+ordering metadata fails snapshot loading; there is no compatibility fallback to
+volume or timestamp freshness. A same-runtime snapshot older than already applied
+sequence state is rejected.
 
 Renewal uses `subscribe_candle` with `history_count=1` every half TTL and keeps
 existing stored history. Set `server_candle_ttl` to the server's lease TTL.
@@ -132,10 +146,10 @@ are safe. The broadcaster uses shared leases, so clients sharing the same
 exchange/symbol/interval must coordinate explicit unsubscription.
 
 PUB/SUB provides no durable replay or per-consumer acknowledgement. This client
-recovers from transport disconnects and explicit recovery notices, but cannot
-prove delivery of every publication or order equal-volume same-bucket updates
-without a gateway sequence number. RECONCILE and recovery snapshots supply
-authoritative corrections.
+recovers from transport disconnects, runtime changes and explicit recovery notices.
+The sequence contract orders equal-volume updates and snapshot handoff, but does
+not prove delivery of every publication or provide durable replay. RECONCILE and
+recovery snapshots supply authoritative corrections.
 
 ## Callback snapshot modes
 

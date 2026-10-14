@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.2.1] - 2026-10-14
+
+### Fixed
+
+- Implement the final aggregated candle stream_id/seq/snapshot_seq contract:
+  replay only matching-runtime events beyond the atomic snapshot boundary, in
+  sequence order, and discard stale or duplicate publications.
+- Use sequence freshness instead of volume, including equal-volume price changes
+  and legitimate volume reductions. Upsert candle rows by timestamp.
+- Recover all intervals after a runtime change in events, snapshots or renewal;
+  never compare counters across runtimes or accept events from a retired runtime.
+- Reject missing ordering metadata, stale snapshots and recovery notices beyond
+  snapshot coverage. Preserve bounded overflow recovery, TTL renewal and cleanup.
+- Add core sequence/restart tests, including actual TCP runtime restart recovery.
+
 ## [0.2.0] - 2026-10-14
 
 ### Changed
