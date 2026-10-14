@@ -1,19 +1,17 @@
-"""
-Focused unit tests for ZMQClient.
-
-No real ZMQ gateway is required.  All ZMQ socket I/O is prevented by
-patching `ZMQClient._send_request` and `zmq.Context` so the client
-under test never dials out.
-"""
+"""Core candle data integrity, callback and lifecycle behavior tests."""
 
 from __future__ import annotations
 
 import logging
+
 import threading
+
 import time
+
 from unittest.mock import MagicMock, patch
 
 import pytest
+
 import zmq
 
 from sk_zmq.client import (
@@ -21,11 +19,6 @@ from sk_zmq.client import (
     GatewayRequestResult,
     ZMQClient,
 )
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 _COMMON_KWARGS = dict(
     client_id="test-client",
@@ -68,11 +61,22 @@ def _make_client(
 
 
 def _make_candle(ts: int, close: float = 100.0) -> dict:
-    return {"ts": ts, "open": 100.0, "high": 105.0, "low": 95.0, "close": close, "volume": 1.0}
+    return {
+        "ts": ts,
+        "open": 100.0,
+        "high": 105.0,
+        "low": 95.0,
+        "close": close,
+        "volume": 1.0,
+    }
 
 
-def _request_ok(data=None) -> GatewayRequestResult:
-    response = {"status": "ok"}
+STREAM = "a" * 32
+RESTART = "b" * 32
+
+
+def _request_ok(data=None, *, stream_id=STREAM, snapshot_seq=0) -> GatewayRequestResult:
+    response = {"status": "ok", "stream_id": stream_id, "snapshot_seq": snapshot_seq}
     if data is not None:
         response["data"] = data
     return GatewayRequestResult.success(data=data, response=response)
@@ -81,568 +85,38 @@ def _request_ok(data=None) -> GatewayRequestResult:
 def _request_failure(
     code: GatewayRequestCode = GatewayRequestCode.GATEWAY_REJECTED,
 ) -> GatewayRequestResult:
-    response = {"status": "error"} if code is GatewayRequestCode.GATEWAY_REJECTED else None
+    response = (
+        {"status": "error"} if code is GatewayRequestCode.GATEWAY_REJECTED else None
+    )
     return GatewayRequestResult.failure(code, response=response)
 
 
 def _inject_update(client: ZMQClient, interval: str, candle: dict) -> None:
     """Drive _handle_candle_event with an UPDATE payload directly."""
     topic = f"UPBIT:CANDLE:{client.symbol}:{interval}:UPDATE"
-    client._handle_candle_event(topic, {"candle": candle})
+    client._handle_candle_event(topic, _event_payload(client, candle=candle))
 
 
-def _inject_close(client: ZMQClient, interval: str, closed_candle: dict, new_candle: dict) -> None:
+def _inject_close(
+    client: ZMQClient, interval: str, closed_candle: dict, new_candle: dict
+) -> None:
     topic = f"UPBIT:CANDLE:{client.symbol}:{interval}:CLOSE"
-    client._handle_candle_event(topic, {"candle": closed_candle, "new": new_candle})
+    client._handle_candle_event(
+        topic, _event_payload(client, candle=closed_candle, new=new_candle)
+    )
 
 
 def _inject_reconcile(client: ZMQClient, interval: str, candle: dict) -> None:
     topic = f"UPBIT:CANDLE:{client.symbol}:{interval}:RECONCILE"
-    client._handle_candle_event(topic, {"candle": candle})
+    client._handle_candle_event(topic, _event_payload(client, candle=candle))
 
 
-# ===========================================================================
-# 1. Interval Validation
-# ===========================================================================
+def _event_payload(client, **fields):
+    client._test_seq = getattr(client, "_test_seq", 0) + 1
+    return dict(fields, stream_id=STREAM, seq=client._test_seq)
 
-class TestIntervalValidation:
-    def test_valid_intervals_accepted(self):
-        valid = ["1m", "3m", "5m", "10m", "30m", "1h", "4h", "1d"]
-        for iv in valid:
-            c = _make_client(intervals=[iv])
-            assert iv in c.candle_deques
-
-    def test_whitespace_stripped_around_valid_interval(self):
-        c = _make_client(intervals=[" 1m "])
-        assert "1m" in c.candle_deques
-
-    def test_invalid_interval_raises(self):
-        with pytest.raises(ValueError):
-            _make_client(intervals=["2m"])
-
-    def test_mixed_invalid_raises(self):
-        with pytest.raises(ValueError):
-            _make_client(intervals=["1m", "bad"])
-
-    def test_multiple_valid_intervals_all_present(self):
-        c = _make_client(intervals=["1m", "5m", "1h"])
-        assert set(c.candle_deques.keys()) == {"1m", "5m", "1h"}
-
-    def test_deque_maxlen_applied(self):
-        c = _make_client(intervals=["1m"], candle_deque_maxlen=42)
-        assert c.candle_deques["1m"].maxlen == 42
-
-    @pytest.mark.parametrize(
-        ("intervals", "candle_deque_maxlen"),
-        [
-            ([], 10),
-            (["1m"], 0),
-            (["1m"], -1),
-        ],
-    )
-    def test_unusable_subscription_config_fails_before_context_allocation(
-        self, intervals, candle_deque_maxlen
-    ):
-        with patch("sk_zmq.client.zmq.Context") as context_factory:
-            with pytest.raises(ValueError):
-                ZMQClient(
-                    intervals=intervals,
-                    candle_handler_callback=lambda _payload: None,
-                    candle_deque_maxlen=candle_deque_maxlen,
-                    **_COMMON_KWARGS,
-                )
-
-        context_factory.assert_not_called()
-
-
-# ===========================================================================
-# 2. Callback Snapshot Mode Validation
-# ===========================================================================
-
-class TestCallbackSnapshotModeValidation:
-    @pytest.mark.parametrize("mode", ["live", "deque_copy", "deep_copy"])
-    def test_valid_mode_accepted(self, mode):
-        c = _make_client(callback_snapshot_mode=mode)
-        assert c.callback_snapshot_mode == mode
-
-    def test_invalid_mode_raises(self):
-        with patch("sk_zmq.client.zmq.Context") as context_factory:
-            with pytest.raises(ValueError):
-                ZMQClient(
-                    intervals=["1m"],
-                    candle_handler_callback=lambda _payload: None,
-                    callback_snapshot_mode="snapshot",
-                    **_COMMON_KWARGS,
-                )
-
-        context_factory.assert_not_called()
-
-
-# ===========================================================================
-# 3. _build_callback_payload snapshot modes
-# ===========================================================================
-
-class TestBuildCallbackPayload:
-    """Tests that the three snapshot modes return payloads with the correct
-    identity / copy semantics, and that the call releases the storage lock
-    (i.e., does not hold the lock after returning)."""
-
-    def _loaded_client(self, mode: str) -> ZMQClient:
-        c = _make_client(intervals=["1m", "5m"], callback_snapshot_mode=mode)
-        for iv in ["1m", "5m"]:
-            c.candle_deques[iv].extend([_make_candle(i) for i in range(3)])
-        return c
-
-    # -- live mode -----------------------------------------------------------
-
-    def test_live_returns_same_dict_object(self):
-        c = self._loaded_client("live")
-        payload = c._build_callback_payload()
-        assert payload is c.candle_deques
-
-    # -- deque_copy mode -----------------------------------------------------
-
-    def test_deque_copy_returns_new_dict(self):
-        c = self._loaded_client("deque_copy")
-        payload = c._build_callback_payload()
-        assert payload is not c.candle_deques
-
-    def test_deque_copy_deques_are_new_containers(self):
-        c = self._loaded_client("deque_copy")
-        payload = c._build_callback_payload()
-        assert payload["1m"] is not c.candle_deques["1m"]
-
-    def test_deque_copy_elements_are_shared(self):
-        c = self._loaded_client("deque_copy")
-        payload = c._build_callback_payload()
-        # Elements should be the same dict objects (not deep-copied)
-        for iv in ["1m", "5m"]:
-            for orig, copied in zip(c.candle_deques[iv], payload[iv]):
-                assert orig is copied
-
-    def test_deque_copy_maxlen_preserved(self):
-        c = _make_client(intervals=["1m"], callback_snapshot_mode="deque_copy", candle_deque_maxlen=50)
-        payload = c._build_callback_payload()
-        assert payload["1m"].maxlen == 50
-
-    def test_deque_copy_contains_same_data(self):
-        c = self._loaded_client("deque_copy")
-        payload = c._build_callback_payload()
-        assert list(payload["1m"]) == list(c.candle_deques["1m"])
-
-    # -- deep_copy mode ------------------------------------------------------
-
-    def test_deep_copy_returns_new_dict(self):
-        c = self._loaded_client("deep_copy")
-        payload = c._build_callback_payload()
-        assert payload is not c.candle_deques
-
-    def test_deep_copy_deques_are_new_containers(self):
-        c = self._loaded_client("deep_copy")
-        payload = c._build_callback_payload()
-        assert payload["1m"] is not c.candle_deques["1m"]
-
-    def test_deep_copy_elements_are_independent(self):
-        c = self._loaded_client("deep_copy")
-        payload = c._build_callback_payload()
-        for iv in ["1m", "5m"]:
-            for orig, copied in zip(c.candle_deques[iv], payload[iv]):
-                # Must be different dict objects (deep copied)
-                assert orig is not copied
-                # But data must be equal
-                assert orig == copied
-
-    def test_deep_copy_mutation_does_not_affect_source(self):
-        c = self._loaded_client("deep_copy")
-        payload = c._build_callback_payload()
-        original_ts = list(c.candle_deques["1m"])[0]["ts"]
-        # Mutate the payload copy
-        list(payload["1m"])[0]["ts"] = 9999
-        # Source deque should be unchanged
-        assert list(c.candle_deques["1m"])[0]["ts"] == original_ts
-
-    # -- lock released after build -------------------------------------------
-
-    def test_storage_lock_released_after_build(self):
-        """_build_callback_payload must release the storage lock when it returns."""
-        for mode in ("live", "deque_copy", "deep_copy"):
-            c = self._loaded_client(mode)
-            c._build_callback_payload()
-            # If the lock is released, we can acquire it immediately
-            acquired = c.storage_lock.acquire(blocking=False)
-            assert acquired, f"storage_lock still held after build in mode={mode!r}"
-            c.storage_lock.release()
-
-
-# ===========================================================================
-# 4. _handle_candle_event filtering
-# ===========================================================================
-
-class TestHandleCandleEventFiltering:
-    """Events that don't match the client's exchange/symbol/interval must be
-    silently ignored without touching the deques or setting data_updated_event."""
-
-    def _client(self) -> ZMQClient:
-        return _make_client(intervals=["1m", "5m"])
-
-    def _event_sets_updated(self, client: ZMQClient, topic: str, payload: dict) -> bool:
-        client.data_updated_event.clear()
-        client._handle_candle_event(topic, payload)
-        return client.data_updated_event.is_set()
-
-    def test_wrong_exchange_ignored(self):
-        c = self._client()
-        topic = "BINANCE:CANDLE:KRW-BTC:1m:UPDATE"
-        payload = {"candle": _make_candle(1)}
-        updated = self._event_sets_updated(c, topic, payload)
-        assert not updated
-        assert len(c.candle_deques["1m"]) == 0
-
-    def test_wrong_symbol_ignored(self):
-        c = self._client()
-        topic = "UPBIT:CANDLE:KRW-ETH:1m:UPDATE"
-        payload = {"candle": _make_candle(1)}
-        updated = self._event_sets_updated(c, topic, payload)
-        assert not updated
-        assert len(c.candle_deques["1m"]) == 0
-
-    def test_unsubscribed_interval_ignored(self):
-        c = self._client()
-        topic = "UPBIT:CANDLE:KRW-BTC:1h:UPDATE"
-        payload = {"candle": _make_candle(1)}
-        updated = self._event_sets_updated(c, topic, payload)
-        assert not updated
-
-    def test_malformed_topic_ignored(self):
-        c = self._client()
-        updated = self._event_sets_updated(c, "UPBIT:CANDLE:KRW-BTC", {"candle": _make_candle(1)})
-        assert not updated
-
-    def test_extra_topic_segments_ignored(self):
-        c = self._client()
-        topic = "UPBIT:CANDLE:KRW-BTC:1m:UPDATE:EXTRA"
-        updated = self._event_sets_updated(c, topic, {"candle": _make_candle(1)})
-        assert not updated
-        assert len(c.candle_deques["1m"]) == 0
-
-    def test_wrong_channel_ignored(self):
-        c = self._client()
-        topic = "UPBIT:TICKER:KRW-BTC:1m:UPDATE"
-        updated = self._event_sets_updated(c, topic, {"candle": _make_candle(1)})
-        assert not updated
-
-    @pytest.mark.parametrize("payload", [None, [], "not-a-dict"])
-    def test_non_dict_payload_ignored(self, payload):
-        c = self._client()
-        topic = "UPBIT:CANDLE:KRW-BTC:1m:UPDATE"
-        updated = self._event_sets_updated(c, topic, payload)
-        assert not updated
-        assert len(c.candle_deques["1m"]) == 0
-
-    def test_exchange_case_insensitive_init(self):
-        """exchange param is lowered; prefix becomes uppercase for filtering."""
-        c = _make_client(intervals=["1m"], exchange="UPBIT")
-        # Sending UPBIT-prefixed topic should be accepted
-        _inject_update(c, "1m", _make_candle(1))
-        assert len(c.candle_deques["1m"]) == 1
-
-
-# ===========================================================================
-# 5. _handle_candle_event UPDATE semantics
-# ===========================================================================
-
-class TestHandleCandleEventUpdate:
-    def test_update_into_empty_deque_appends(self):
-        c = _make_client(intervals=["1m"])
-        candle = _make_candle(1)
-        _inject_update(c, "1m", candle)
-        assert len(c.candle_deques["1m"]) == 1
-        assert c.candle_deques["1m"][-1] == candle
-
-    def test_update_replaces_last_element(self):
-        c = _make_client(intervals=["1m"])
-        c.candle_deques["1m"].append(_make_candle(1, close=50.0))
-        new_candle = _make_candle(1, close=99.0)
-        _inject_update(c, "1m", new_candle)
-        assert len(c.candle_deques["1m"]) == 1
-        assert c.candle_deques["1m"][-1]["close"] == 99.0
-
-    def test_update_sets_data_updated_event(self):
-        c = _make_client(intervals=["1m"])
-        c.data_updated_event.clear()
-        _inject_update(c, "1m", _make_candle(1))
-        assert c.data_updated_event.is_set()
-
-    def test_update_identical_candle_does_not_set_data_updated_event(self):
-        c = _make_client(intervals=["1m"])
-        candle = _make_candle(1, close=100.0)
-        c.candle_deques["1m"].append(dict(candle))
-        c.data_updated_event.clear()
-        _inject_update(c, "1m", dict(candle))
-        assert not c.data_updated_event.is_set()
-        assert list(c.candle_deques["1m"]) == [candle]
-
-    def test_update_missing_candle_key_ignored(self):
-        c = _make_client(intervals=["1m"])
-        c.data_updated_event.clear()
-        topic = "UPBIT:CANDLE:KRW-BTC:1m:UPDATE"
-        c._handle_candle_event(topic, {})  # no 'candle' key
-        assert not c.data_updated_event.is_set()
-        assert len(c.candle_deques["1m"]) == 0
-
-    def test_update_non_dict_candle_ignored(self):
-        c = _make_client(intervals=["1m"])
-        existing = _make_candle(1, close=50.0)
-        c.candle_deques["1m"].append(existing)
-        c.data_updated_event.clear()
-        topic = "UPBIT:CANDLE:KRW-BTC:1m:UPDATE"
-        c._handle_candle_event(topic, {"candle": []})
-        assert not c.data_updated_event.is_set()
-        assert len(c.candle_deques["1m"]) == 1
-        assert c.candle_deques["1m"][-1] == existing
-
-    def test_update_only_affects_target_interval(self):
-        c = _make_client(intervals=["1m", "5m"])
-        _inject_update(c, "1m", _make_candle(1))
-        assert len(c.candle_deques["5m"]) == 0
-
-
-# ===========================================================================
-# 6. _handle_candle_event CLOSE semantics
-# ===========================================================================
-
-class TestHandleCandleEventClose:
-    def test_close_updates_last_and_appends_new(self):
-        c = _make_client(intervals=["1m"])
-        c.candle_deques["1m"].append(_make_candle(1, close=50.0))
-        closed = _make_candle(1, close=55.0)
-        new = _make_candle(2, close=60.0)
-        _inject_close(c, "1m", closed, new)
-        assert len(c.candle_deques["1m"]) == 2
-        assert c.candle_deques["1m"][-2]["close"] == 55.0
-        assert c.candle_deques["1m"][-1]["close"] == 60.0
-
-    def test_close_into_empty_deque_appends_both(self):
-        c = _make_client(intervals=["1m"])
-        closed = _make_candle(1)
-        new = _make_candle(2)
-        _inject_close(c, "1m", closed, new)
-        assert len(c.candle_deques["1m"]) == 2
-
-    def test_close_missing_candle_key_ignored(self):
-        c = _make_client(intervals=["1m"])
-        c.data_updated_event.clear()
-        topic = "UPBIT:CANDLE:KRW-BTC:1m:CLOSE"
-        c._handle_candle_event(topic, {"new": _make_candle(2)})  # no 'candle'
-        assert not c.data_updated_event.is_set()
-
-    def test_close_missing_new_key_ignored(self):
-        c = _make_client(intervals=["1m"])
-        c.data_updated_event.clear()
-        topic = "UPBIT:CANDLE:KRW-BTC:1m:CLOSE"
-        c._handle_candle_event(topic, {"candle": _make_candle(1)})  # no 'new'
-        assert not c.data_updated_event.is_set()
-
-    @pytest.mark.parametrize(
-        "payload",
-        [
-            {"candle": [], "new": _make_candle(2)},
-            {"candle": _make_candle(1), "new": []},
-            {"candle": [], "new": []},
-        ],
-    )
-    def test_close_non_dict_candle_or_new_ignored(self, payload):
-        c = _make_client(intervals=["1m"])
-        existing = _make_candle(1, close=50.0)
-        c.candle_deques["1m"].append(existing)
-        c.data_updated_event.clear()
-        topic = "UPBIT:CANDLE:KRW-BTC:1m:CLOSE"
-        c._handle_candle_event(topic, payload)
-        assert not c.data_updated_event.is_set()
-        assert list(c.candle_deques["1m"]) == [existing]
-
-    def test_close_sets_data_updated_event(self):
-        c = _make_client(intervals=["1m"])
-        c.data_updated_event.clear()
-        _inject_close(c, "1m", _make_candle(1), _make_candle(2))
-        assert c.data_updated_event.is_set()
-
-    def test_close_does_not_set_event_when_bounded_storage_is_unchanged(self):
-        c = _make_client(intervals=["1m"], candle_deque_maxlen=1)
-        candle = _make_candle(1)
-        c.candle_deques["1m"].append(candle)
-
-        _inject_close(c, "1m", dict(candle), dict(candle))
-
-        assert list(c.candle_deques["1m"]) == [candle]
-        assert not c.data_updated_event.is_set()
-
-
-# ===========================================================================
-# 7. _handle_candle_event RECONCILE semantics
-# ===========================================================================
-
-class TestHandleCandleEventReconcile:
-    def test_reconcile_replaces_matching_ts(self):
-        c = _make_client(intervals=["1m"])
-        c.candle_deques["1m"].extend([_make_candle(i) for i in range(5)])
-        patched = _make_candle(2, close=999.0)
-        _inject_reconcile(c, "1m", patched)
-        assert c.candle_deques["1m"][2]["close"] == 999.0
-
-    def test_reconcile_no_match_leaves_deque_unchanged(self):
-        c = _make_client(intervals=["1m"])
-        original = [_make_candle(i) for i in range(3)]
-        c.candle_deques["1m"].extend(original)
-        _inject_reconcile(c, "1m", _make_candle(99, close=1.0))
-        # All ts values should be unchanged
-        assert all(c.candle_deques["1m"][i]["ts"] == i for i in range(3))
-
-    def test_reconcile_no_match_does_not_set_data_updated_event(self):
-        c = _make_client(intervals=["1m"])
-        c.candle_deques["1m"].append(_make_candle(1))
-        c.data_updated_event.clear()
-        _inject_reconcile(c, "1m", _make_candle(99, close=1.0))
-        assert not c.data_updated_event.is_set()
-
-    def test_reconcile_identical_candle_does_not_set_data_updated_event(self):
-        c = _make_client(intervals=["1m"])
-        candle = _make_candle(1, close=100.0)
-        c.candle_deques["1m"].append(dict(candle))
-        c.data_updated_event.clear()
-        _inject_reconcile(c, "1m", dict(candle))
-        assert not c.data_updated_event.is_set()
-        assert list(c.candle_deques["1m"]) == [candle]
-
-    def test_reconcile_missing_candle_key_ignored(self):
-        c = _make_client(intervals=["1m"])
-        c.data_updated_event.clear()
-        topic = "UPBIT:CANDLE:KRW-BTC:1m:RECONCILE"
-        c._handle_candle_event(topic, {})
-        assert not c.data_updated_event.is_set()
-
-    def test_reconcile_non_dict_candle_ignored(self):
-        c = _make_client(intervals=["1m"])
-        existing = _make_candle(1, close=50.0)
-        c.candle_deques["1m"].append(existing)
-        c.data_updated_event.clear()
-        topic = "UPBIT:CANDLE:KRW-BTC:1m:RECONCILE"
-        c._handle_candle_event(topic, {"candle": []})
-        assert not c.data_updated_event.is_set()
-        assert list(c.candle_deques["1m"]) == [existing]
-
-    def test_reconcile_missing_ts_key_ignored(self):
-        c = _make_client(intervals=["1m"])
-        c.candle_deques["1m"].append(_make_candle(1))
-        c.data_updated_event.clear()
-        topic = "UPBIT:CANDLE:KRW-BTC:1m:RECONCILE"
-        c._handle_candle_event(topic, {"candle": {"close": 1.0}})  # no 'ts'
-        assert not c.data_updated_event.is_set()
-
-    def test_reconcile_sets_data_updated_event(self):
-        c = _make_client(intervals=["1m"])
-        c.candle_deques["1m"].append(_make_candle(1))
-        c.data_updated_event.clear()
-        _inject_reconcile(c, "1m", _make_candle(1, close=200.0))
-        assert c.data_updated_event.is_set()
-
-    def test_reconcile_only_replaces_last_matching(self):
-        """If the same ts appears more than once, only one entry is patched
-        (the search is from the tail, and breaks after first match)."""
-        c = _make_client(intervals=["1m"])
-        # Add duplicate ts entries
-        c.candle_deques["1m"].extend([_make_candle(1, close=10.0), _make_candle(1, close=20.0)])
-        _inject_reconcile(c, "1m", _make_candle(1, close=99.0))
-        values = [d["close"] for d in c.candle_deques["1m"]]
-        # Only the last occurrence (index 1) should be patched
-        assert values == [10.0, 99.0]
-
-    def test_unknown_event_type_is_ignored(self):
-        c = _make_client(intervals=["1m"])
-        c.candle_deques["1m"].append(_make_candle(1, close=10.0))
-        c.data_updated_event.clear()
-        topic = "UPBIT:CANDLE:KRW-BTC:1m:SNAPSHOT"
-        c._handle_candle_event(topic, {"candle": _make_candle(1, close=99.0)})
-        assert c.candle_deques["1m"][-1]["close"] == 10.0
-        assert not c.data_updated_event.is_set()
-
-
-# ===========================================================================
-# 8. Callback runs outside the storage lock
-# ===========================================================================
-
-class TestCallbackOutsideLock:
-    """Verify that the callback payload is built and the lock is released
-    before the user callback is invoked (i.e., the lock is not held during
-    the callback call in _strategy_trigger_thread)."""
-
-    def test_lock_not_held_inside_callback_for_deque_copy(self):
-        """The callback receives a copy, so the live lock is not relevant.
-        We verify that the storage lock is acquirable from inside the callback."""
-        lock_acquirable_inside_callback: list[bool] = []
-
-        def cb(payload):
-            # Try to acquire storage_lock without blocking
-            result = client.storage_lock.acquire(blocking=False)
-            lock_acquirable_inside_callback.append(result)
-            if result:
-                client.storage_lock.release()
-
-        client = _make_client(intervals=["1m"], callback=cb, callback_snapshot_mode="deque_copy")
-        client.candle_deques["1m"].append(_make_candle(1))
-
-        # Simulate what _strategy_trigger_thread does for each callback cycle
-        payload = client._build_callback_payload()
-        client.candle_handler_callback(payload)
-
-        assert lock_acquirable_inside_callback == [True], (
-            "storage_lock was held during callback execution"
-        )
-
-
-# ===========================================================================
-# 9. Stop and thread cleanup
-# ===========================================================================
 
 class TestStopAndThreadCleanup:
-    """Tests for the stop() lifecycle without a real gateway.
-
-    We patch _send_request to return a structured failure quickly so
-    unsubscribe calls don't block.
-    """
-
-    def _start_threads_directly(self, client: ZMQClient) -> None:
-        """Start only the data_listener and strategy_trigger threads.
-        Skip renewer (it would call _send_request in a real loop).
-        This avoids needing a gateway while still testing thread lifecycle.
-        """
-        with patch.object(client, "_data_listener_thread", client._data_listener_thread), \
-             patch("sk_zmq.client.zmq.Context"):
-            listener = threading.Thread(target=_noop_listener, args=(client,), name="ZMQListener", daemon=True)
-            trigger = threading.Thread(target=client._strategy_trigger_thread, name="StrategyTrigger", daemon=True)
-            client.threads.extend([listener, trigger])
-            listener.start()
-            trigger.start()
-
-    def test_stop_sets_stop_event(self):
-        client = _make_client()
-        with patch.object(client, "_send_request", return_value=_request_failure()):
-            client.stop()
-        assert client.stop_event.is_set()
-
-    def test_stop_joins_threads(self):
-        """All threads registered in client.threads are joined (not alive) after stop()."""
-        client = _make_client(intervals=["1m"], throttle_seconds=0.05)
-        self._start_threads_directly(client)
-
-        time.sleep(0.05)  # let threads start
-
-        with patch.object(client, "_send_request", return_value=_request_failure()):
-            client.stop()
-
-        for t in client.threads:
-            assert not t.is_alive(), f"Thread {t.name!r} still alive after stop()"
-
     def test_stop_waits_for_in_flight_callback_before_returning(self):
         callback_entered = threading.Event()
         release_callback = threading.Event()
@@ -651,7 +125,9 @@ class TestStopAndThreadCleanup:
             callback_entered.set()
             assert release_callback.wait(timeout=2)
 
-        client = _make_client(intervals=["1m"], callback=callback, throttle_seconds=None)
+        client = _make_client(
+            intervals=["1m"], callback=callback, throttle_seconds=None
+        )
         trigger = threading.Thread(
             target=client._strategy_trigger_thread,
             name="StrategyTrigger",
@@ -687,7 +163,9 @@ class TestStopAndThreadCleanup:
             client.stop()
             callback_stop_returned.set()
 
-        client = _make_client(intervals=["1m"], callback=callback, throttle_seconds=None)
+        client = _make_client(
+            intervals=["1m"], callback=callback, throttle_seconds=None
+        )
         trigger = threading.Thread(
             target=client._strategy_trigger_thread,
             name="StrategyTrigger",
@@ -725,7 +203,9 @@ class TestStopAndThreadCleanup:
             callback_stop_returned.set()
             assert release_callback.wait(timeout=2)
 
-        client = _make_client(intervals=["1m"], callback=callback, throttle_seconds=None)
+        client = _make_client(
+            intervals=["1m"], callback=callback, throttle_seconds=None
+        )
         trigger = threading.Thread(
             target=client._strategy_trigger_thread,
             name="StrategyTrigger",
@@ -783,14 +263,6 @@ class TestStopAndThreadCleanup:
         assert client.context.closed
         assert send_request.call_count == 1
 
-    def test_stop_without_started_threads(self):
-        """stop() with no threads in client.threads must not raise."""
-        client = _make_client()
-        assert client.threads == []
-        with patch.object(client, "_send_request", return_value=_request_failure()):
-            client.stop()
-        assert client.stop_event.is_set()
-
     def test_stop_completes_cleanup_when_unsubscribe_raises(self):
         client = _make_client(intervals=["1m"])
 
@@ -820,7 +292,9 @@ class TestStopAndThreadCleanup:
             except RuntimeError:
                 cleanup_failed.set()
 
-        client = _make_client(intervals=["1m"], callback=callback, throttle_seconds=None)
+        client = _make_client(
+            intervals=["1m"], callback=callback, throttle_seconds=None
+        )
         client.context.term.side_effect = [RuntimeError("term failed"), None]
         trigger = threading.Thread(
             target=client._strategy_trigger_thread,
@@ -837,224 +311,6 @@ class TestStopAndThreadCleanup:
         assert not trigger.is_alive()
         assert client.context.term.call_count == 2
 
-    def test_stop_uses_bounded_unsubscribe_request_budget(self):
-        client = _make_client(intervals=["1m", "5m"])
-
-        with patch.object(
-            client, "_send_request", return_value=_request_failure()
-        ) as send_request:
-            client.stop()
-
-        assert send_request.call_count == 2
-        for call in send_request.call_args_list:
-            assert call.kwargs == {
-                "max_retries": 1,
-                "receive_timeout_ms": client._STOP_UNSUBSCRIBE_TIMEOUT_MS,
-            }
-        client.context.term.assert_called_once_with()
-
-def _noop_listener(client: ZMQClient) -> None:
-    """A stand-in for _data_listener_thread that just waits for stop_event."""
-    client.stop_event.wait()
-
-
-def _ready_listener(ready_event=None, run_event=None, failed_event=None) -> None:
-    if ready_event is not None:
-        ready_event.set()
-    if run_event is not None:
-        run_event.wait(timeout=1)
-
-
-class _InvalidJsonThenStopSocket:
-    def __init__(self, client: ZMQClient):
-        self.client = client
-        self.closed = False
-
-    def connect(self, _endpoint):
-        pass
-
-    def setsockopt_string(self, _option, _value):
-        pass
-
-    def poll(self, _timeout):
-        return True
-
-    def recv_multipart(self):
-        self.client.stop_event.set()
-        return [b"UPBIT:CANDLE:KRW-BTC:1m:UPDATE", b"{"]
-
-    def close(self):
-        self.closed = True
-
-
-class _MalformedMultipartThenStopSocket:
-    def __init__(self, client: ZMQClient, frames):
-        self.client = client
-        self.frames = frames
-        self.closed = False
-
-    def connect(self, _endpoint):
-        pass
-
-    def setsockopt_string(self, _option, _value):
-        pass
-
-    def poll(self, _timeout):
-        return True
-
-    def recv_multipart(self):
-        self.client.stop_event.set()
-        return self.frames
-
-    def close(self):
-        self.closed = True
-
-
-class _NonDictResponseSocket:
-    def __init__(self):
-        self.closed = False
-
-    def setsockopt(self, _option, _value):
-        pass
-
-    def connect(self, _endpoint):
-        pass
-
-    def send(self, _payload):
-        pass
-
-    def recv(self):
-        return b'["bad"]'
-
-    def close(self):
-        self.closed = True
-
-
-class _EncodedResponseSocket(_NonDictResponseSocket):
-    def __init__(self, payload: bytes):
-        super().__init__()
-        self.payload = payload
-
-    def recv(self):
-        return self.payload
-
-
-class TestDataListenerMalformedPayloads:
-    def test_invalid_json_payload_is_ignored_without_crashing_listener(self):
-        client = _make_client(intervals=["1m"])
-        socket = _InvalidJsonThenStopSocket(client)
-        client.context.socket.return_value = socket
-
-        client._data_listener_thread()
-
-        assert socket.closed
-        assert len(client.candle_deques["1m"]) == 0
-        assert not client.data_updated_event.is_set()
-
-    @pytest.mark.parametrize(
-        "frames",
-        [
-            [b"UPBIT:CANDLE:KRW-BTC:1m:UPDATE"],
-            [b"UPBIT:CANDLE:KRW-BTC:1m:UPDATE", b'{"candle": {"ts": 1}}', b"extra"],
-        ],
-    )
-    def test_malformed_multipart_payload_is_ignored_without_crashing_listener(self, frames):
-        client = _make_client(intervals=["1m"])
-        socket = _MalformedMultipartThenStopSocket(client, frames)
-        client.context.socket.return_value = socket
-
-        client._data_listener_thread()
-
-        assert socket.closed
-        assert len(client.candle_deques["1m"]) == 0
-        assert not client.data_updated_event.is_set()
-
-
-# ===========================================================================
-# 10. _strategy_trigger_thread callback invocation
-# ===========================================================================
-
-class TestStrategyTriggerThread:
-    """Verify the trigger thread calls the callback when data_updated_event fires."""
-
-    def test_throttled_callback_called_on_update(self):
-        call_count = [0]
-
-        def cb(payload):
-            call_count[0] += 1
-
-        client = _make_client(intervals=["1m"], callback=cb, throttle_seconds=0.05)
-
-        trigger = threading.Thread(
-            target=client._strategy_trigger_thread,
-            name="StrategyTrigger",
-            daemon=True,
-        )
-        trigger.start()
-
-        # Inject an update to trigger callback
-        _inject_update(client, "1m", _make_candle(1))
-        time.sleep(0.2)  # wait for at least one throttle cycle
-
-        client.stop_event.set()
-        trigger.join(timeout=2)
-
-        assert call_count[0] >= 1
-
-    def test_unthrottled_callback_called_on_update(self):
-        call_count = [0]
-
-        def cb(payload):
-            call_count[0] += 1
-
-        client = _make_client(intervals=["1m"], callback=cb, throttle_seconds=None)
-
-        trigger = threading.Thread(
-            target=client._strategy_trigger_thread,
-            name="StrategyTrigger",
-            daemon=True,
-        )
-        trigger.start()
-
-        _inject_update(client, "1m", _make_candle(1))
-        time.sleep(0.2)
-
-        client.stop_event.set()
-        client.data_updated_event.set()  # unblock the wait(timeout=1) if needed
-        trigger.join(timeout=2)
-
-        assert call_count[0] >= 1
-
-    def test_callback_exception_does_not_kill_trigger_thread(self):
-        """An exception in the callback must not crash the trigger thread."""
-        def bad_cb(payload):
-            raise RuntimeError("intentional test error")
-
-        client = _make_client(intervals=["1m"], callback=bad_cb, throttle_seconds=0.05)
-
-        trigger = threading.Thread(
-            target=client._strategy_trigger_thread,
-            name="StrategyTrigger",
-            daemon=True,
-        )
-        trigger.start()
-
-        # Fire two updates; the thread should survive both
-        _inject_update(client, "1m", _make_candle(1))
-        time.sleep(0.15)
-        _inject_update(client, "1m", _make_candle(2))
-        time.sleep(0.15)
-
-        assert trigger.is_alive(), "Trigger thread died after callback exception"
-
-        client.stop_event.set()
-        trigger.join(timeout=2)
-
-
-# ===========================================================================
-# 11. Start + renewal lifecycle
-# ===========================================================================
-
 
 class _FiniteWait:
     def __init__(self, cycles: int):
@@ -1064,15 +320,6 @@ class _FiniteWait:
     def __call__(self, timeout=None) -> bool:
         self.calls += 1
         return self.calls > self.cycles
-
-
-class _RecordingWait:
-    def __init__(self):
-        self.timeouts = []
-
-    def __call__(self, timeout=None) -> bool:
-        self.timeouts.append(timeout)
-        return True
 
 
 class _StopOnWait:
@@ -1090,13 +337,6 @@ class _StopOnWait:
 
 
 class TestLifecycleStartAndRenewal:
-    """Lifecycle tests around start() and subscription renewal behavior."""
-
-    @pytest.mark.parametrize("server_candle_ttl", [0, -1])
-    def test_non_positive_server_candle_ttl_raises(self, server_candle_ttl):
-        with pytest.raises(ValueError):
-            _make_client(server_candle_ttl=server_candle_ttl)
-
     def test_short_ttl_schedules_renewal_before_expiration(self):
         client = _make_client(server_candle_ttl=5)
         wait = _RecordingWait()
@@ -1106,241 +346,6 @@ class TestLifecycleStartAndRenewal:
 
         assert len(wait.timeouts) == 1
         assert 0 < wait.timeouts[0] < client.server_candle_ttl
-
-    def test_start_sends_initial_snapshot_requests_for_all_intervals(self):
-        client = _make_client(intervals=["1m", "5m"], candle_deque_maxlen=4)
-        responses = [
-            _request_ok([_make_candle(1)]),
-            _request_ok([_make_candle(2)]),
-        ]
-
-        with patch.object(client, "_send_request", side_effect=responses) as send_request, \
-            patch.object(
-                client, "_data_listener_thread", side_effect=_ready_listener
-            ), \
-            patch.object(client, "_strategy_trigger_thread", return_value=None), \
-            patch.object(client, "_subscription_renewer_thread", return_value=None):
-            assert client.start() is True
-
-        for t in client.threads:
-            t.join(timeout=1)
-
-        assert [call.args[0] for call in send_request.call_args_list] == [
-            {
-                "action": "subscribe_candle",
-                "symbol": "KRW-BTC",
-                "interval": "1m",
-                "history_count": 4,
-                "exchange": "upbit",
-            },
-            {
-                "action": "subscribe_candle",
-                "symbol": "KRW-BTC",
-                "interval": "5m",
-                "history_count": 4,
-                "exchange": "upbit",
-            },
-        ]
-        assert len(client.threads) == 3
-
-    def test_start_caps_gateway_history_without_capping_local_storage(self):
-        client = _make_client(intervals=["1m"], candle_deque_maxlen=500)
-
-        with patch.object(
-            client, "_send_request", return_value=_request_ok([_make_candle(1)])
-        ) as send_request, patch.object(
-            client, "_data_listener_thread", side_effect=_ready_listener
-        ), patch.object(
-            client, "_strategy_trigger_thread", return_value=None
-        ), patch.object(
-            client, "_subscription_renewer_thread", return_value=None
-        ):
-            assert client.start() is True
-
-        for thread in client.threads:
-            thread.join(timeout=1)
-
-        assert send_request.call_args.args[0]["history_count"] == 200
-        assert client.candle_deques["1m"].maxlen == 500
-
-    def test_start_refuses_second_lifecycle_transition(self):
-        client = _make_client(intervals=["1m"])
-
-        with patch.object(
-            client, "_send_request", return_value=_request_ok([_make_candle(1)])
-        ) as send_request, patch.object(
-            client, "_data_listener_thread", side_effect=_ready_listener
-        ), patch.object(
-            client, "_strategy_trigger_thread", return_value=None
-        ), patch.object(
-            client, "_subscription_renewer_thread", return_value=None
-        ):
-            assert client.start() is True
-            assert client.start() is False
-
-        assert send_request.call_count == 1
-
-    @pytest.mark.parametrize(
-        "snapshot_response",
-        [
-            _request_failure(GatewayRequestCode.TIMEOUT),
-            _request_ok([]),
-            _request_failure(),
-        ],
-    )
-    def test_start_returns_false_and_starts_no_threads_when_snapshot_fails_or_empty(self, snapshot_response):
-        client = _make_client(intervals=["1m"])
-        with patch.object(client, "_send_request", return_value=snapshot_response) as send_request:
-            assert client.start() is False
-        assert send_request.call_count == 1
-        assert client.threads == []
-
-    @pytest.mark.parametrize("snapshot_data", ["bad", {"ts": 1}, ["bad"], [None]])
-    def test_start_rejects_malformed_snapshot_data(self, snapshot_data):
-        client = _make_client(intervals=["1m"])
-        response = _request_ok(snapshot_data)
-
-        with patch.object(client, "_send_request", return_value=response) as send_request:
-            assert client.start() is False
-
-        assert send_request.call_count == 1
-        assert client.threads == []
-        assert list(client.candle_deques["1m"]) == []
-
-    def test_start_failure_leaves_no_partial_snapshot_before_retry(self):
-        client = _make_client(intervals=["1m", "5m"])
-        first_snapshot = _make_candle(1)
-        responses = [
-            _request_ok([first_snapshot]),
-            _request_failure(),
-            _request_ok([first_snapshot]),
-            _request_ok([_make_candle(2)]),
-        ]
-
-        with patch.object(client, "_send_request", side_effect=responses), \
-            patch.object(
-                client, "_data_listener_thread", side_effect=_ready_listener
-            ), \
-            patch.object(client, "_strategy_trigger_thread", return_value=None), \
-            patch.object(client, "_subscription_renewer_thread", return_value=None):
-            assert client.start() is False
-            assert list(client.candle_deques["1m"]) == []
-            assert list(client.candle_deques["5m"]) == []
-
-            assert client.start() is True
-
-        for thread in client.threads:
-            thread.join(timeout=1)
-
-        assert list(client.candle_deques["1m"]) == [first_snapshot]
-        assert list(client.candle_deques["5m"]) == [_make_candle(2)]
-
-    def test_send_request_rejects_decoded_non_dict_response(self):
-        client = _make_client(intervals=["1m"])
-        socket = _NonDictResponseSocket()
-        client.context.socket.return_value = socket
-
-        result = client._send_request({"action": "subscribe_candle"}, max_retries=1)
-
-        assert result.code is GatewayRequestCode.INVALID_RESPONSE
-        assert socket.closed
-
-    def test_send_request_parses_success_at_gateway_boundary(self):
-        client = _make_client(intervals=["1m"])
-        socket = _EncodedResponseSocket(b'{"status":"ok","data":[{"ts":1}]}')
-        client.context.socket.return_value = socket
-
-        result = client._send_request({"action": "subscribe_candle"}, max_retries=1)
-
-        assert result.code is GatewayRequestCode.OK
-        assert result.data == [{"ts": 1}]
-        assert socket.closed
-
-    def test_send_request_parses_gateway_rejection_without_message_matching(self):
-        client = _make_client(intervals=["1m"])
-        socket = _EncodedResponseSocket(
-            b'{"status":"error","message":"arbitrary external text"}'
-        )
-        client.context.socket.return_value = socket
-
-        result = client._send_request({"action": "subscribe_candle"}, max_retries=1)
-
-        assert result.code is GatewayRequestCode.GATEWAY_REJECTED
-        assert result.response == {
-            "status": "error",
-            "message": "arbitrary external text",
-        }
-        assert socket.closed
-
-    @pytest.mark.parametrize("status", [None, "success", 1])
-    def test_send_request_rejects_status_outside_gateway_schema(self, status):
-        client = _make_client(intervals=["1m"])
-        encoded_status = b"null" if status is None else str(status).lower().encode()
-        if isinstance(status, str):
-            encoded_status = b'"' + status.encode() + b'"'
-        socket = _EncodedResponseSocket(b'{"status":' + encoded_status + b"}")
-        client.context.socket.return_value = socket
-
-        result = client._send_request({"action": "subscribe_candle"}, max_retries=1)
-
-        assert result.code is GatewayRequestCode.INVALID_RESPONSE
-        assert socket.closed
-
-    def test_send_request_handles_socket_creation_failure(self):
-        client = _make_client(intervals=["1m"])
-        client.context.socket.side_effect = zmq.ZMQError("socket setup failed")
-
-        result = client._send_request({"action": "subscribe_candle"}, max_retries=1)
-
-        assert result.code is GatewayRequestCode.TRANSPORT_ERROR
-
-    def test_send_request_reports_invalid_request_without_opening_socket(self):
-        client = _make_client(intervals=["1m"])
-
-        result = client._send_request(
-            {"action": "subscribe_candle", "invalid": object()}, max_retries=1
-        )
-
-        assert result.code is GatewayRequestCode.INVALID_REQUEST
-        client.context.socket.assert_not_called()
-
-    def test_send_request_closes_socket_when_connect_fails(self):
-        client = _make_client(intervals=["1m"])
-        socket = MagicMock()
-        socket.connect.side_effect = zmq.ZMQError("connect failed")
-        client.context.socket.return_value = socket
-
-        result = client._send_request({"action": "subscribe_candle"}, max_retries=1)
-
-        assert result.code is GatewayRequestCode.TRANSPORT_ERROR
-        socket.close.assert_called_once_with()
-
-    def test_send_request_uses_custom_receive_timeout(self):
-        client = _make_client(intervals=["1m"])
-        socket = MagicMock()
-        socket.recv.side_effect = zmq.Again()
-        client.context.socket.return_value = socket
-
-        result = client._send_request(
-            {"action": "unsubscribe_candle"},
-            max_retries=1,
-            receive_timeout_ms=250,
-        )
-
-        assert result.code is GatewayRequestCode.TIMEOUT
-        socket.setsockopt.assert_any_call(zmq.RCVTIMEO, 250)
-
-    def test_send_request_stops_retrying_when_shutdown_is_requested(self):
-        client = _make_client(intervals=["1m"])
-        socket = MagicMock()
-        socket.recv.side_effect = zmq.Again()
-        client.context.socket.return_value = socket
-        client.stop_event.set()
-
-        result = client._send_request({"action": "subscribe_candle"})
-
-        assert result.code is GatewayRequestCode.CANCELED
-        assert socket.send.call_count == 1
 
     def test_send_request_interrupts_retry_backoff_on_shutdown(self):
         client = _make_client(intervals=["1m"])
@@ -1356,235 +361,6 @@ class TestLifecycleStartAndRenewal:
         assert socket.send.call_count == 1
         assert stop_event.timeouts == [2]
 
-    def test_start_returns_false_when_request_socket_setup_fails(self):
-        client = _make_client(intervals=["1m"])
-        client.context.socket.side_effect = zmq.ZMQError("socket setup failed")
-
-        with patch.object(type(client.stop_event), "wait", return_value=False):
-            assert client.start() is False
-
-        assert client.context.socket.call_count == 5
-        assert client.threads == []
-
-    def test_start_returns_false_when_listener_socket_creation_fails(self):
-        client = _make_client(intervals=["1m"])
-        client.context.socket.side_effect = zmq.ZMQError("SUB setup failed")
-
-        with patch.object(
-            client,
-            "_send_request",
-            return_value=_request_ok([_make_candle(1)]),
-        ), patch.object(
-            client,
-            "_subscription_renewer_thread",
-            return_value=None,
-        ) as renewer, patch.object(
-            client,
-            "_strategy_trigger_thread",
-            return_value=None,
-        ) as trigger, patch("threading.excepthook"):
-            assert client.start() is False
-
-        assert client.threads == []
-        assert list(client.candle_deques["1m"]) == []
-        renewer.assert_not_called()
-        trigger.assert_not_called()
-
-    def test_start_closes_listener_socket_when_connect_fails(self):
-        client = _make_client(intervals=["1m"])
-        socket = MagicMock()
-        socket.connect.side_effect = zmq.ZMQError("SUB connect failed")
-        client.context.socket.return_value = socket
-
-        with patch.object(
-            client,
-            "_send_request",
-            return_value=_request_ok([_make_candle(1)]),
-        ), patch.object(
-            client,
-            "_subscription_renewer_thread",
-            return_value=None,
-        ), patch.object(
-            client,
-            "_strategy_trigger_thread",
-            return_value=None,
-        ), patch("threading.excepthook"):
-            assert client.start() is False
-
-        socket.close.assert_called_once_with()
-        assert client.threads == []
-        assert list(client.candle_deques["1m"]) == []
-
-    def test_start_stops_snapshot_requests_after_shutdown(self):
-        client = _make_client(intervals=["1m", "5m"])
-        first_snapshot_started = threading.Event()
-        release_first_snapshot = threading.Event()
-        both_unsubscribed = threading.Event()
-        calls = []
-        calls_lock = threading.Lock()
-        start_result = []
-
-        def send_request(request, **_kwargs):
-            action = request["action"]
-            interval = request["interval"]
-            if action == "subscribe_candle" and interval == "1m":
-                first_snapshot_started.set()
-                assert release_first_snapshot.wait(timeout=2)
-            with calls_lock:
-                calls.append((action, interval))
-                if sum(action == "unsubscribe_candle" for action, _ in calls) == 2:
-                    both_unsubscribed.set()
-            if action == "subscribe_candle":
-                return _request_ok([_make_candle(1)])
-            return _request_ok()
-
-        with patch.object(client, "_send_request", side_effect=send_request), \
-            patch.object(
-                client, "_data_listener_thread", side_effect=_ready_listener
-            ), \
-            patch.object(client, "_strategy_trigger_thread", return_value=None), \
-            patch.object(client, "_subscription_renewer_thread", return_value=None):
-            starter = threading.Thread(target=lambda: start_result.append(client.start()))
-            starter.start()
-            assert first_snapshot_started.wait(timeout=1)
-
-            stopper = threading.Thread(target=client.stop)
-            stopper.start()
-            both_unsubscribed.wait(timeout=0.25)
-            release_first_snapshot.set()
-
-            starter.join(timeout=2)
-            stopper.join(timeout=2)
-
-        assert start_result == [False]
-        assert not starter.is_alive()
-        assert not stopper.is_alive()
-        assert calls == [
-            ("subscribe_candle", "1m"),
-            ("unsubscribe_candle", "1m"),
-            ("unsubscribe_candle", "5m"),
-        ]
-        assert client.threads == []
-
-    def test_stop_prevents_startup_publication_after_final_check(self):
-        client = _make_client(intervals=["1m"])
-        storage_entered = threading.Event()
-        release_storage = threading.Event()
-        start_result = []
-
-        class BlockingStorageLock:
-            def __enter__(self):
-                storage_entered.set()
-                assert release_storage.wait(timeout=2)
-
-            def __exit__(self, *_args):
-                return False
-
-        client.storage_lock = BlockingStorageLock()
-
-        with patch.object(
-            client,
-            "_send_request",
-            return_value=_request_ok([_make_candle(1)]),
-        ), patch.object(
-            client,
-            "_data_listener_thread",
-            side_effect=_ready_listener,
-        ), patch.object(
-            client,
-            "_strategy_trigger_thread",
-            return_value=None,
-        ), patch.object(
-            client,
-            "_subscription_renewer_thread",
-            return_value=None,
-        ):
-            starter = threading.Thread(target=lambda: start_result.append(client.start()))
-            starter.start()
-            assert storage_entered.wait(timeout=1)
-
-            stopper = threading.Thread(target=client.stop)
-            stopper.start()
-            assert client.stop_event.wait(timeout=1)
-            release_storage.set()
-
-            starter.join(timeout=2)
-            stopper.join(timeout=2)
-
-        assert start_result == [False]
-        assert client.threads == []
-        client.context.term.assert_called_once_with()
-
-    @pytest.mark.parametrize(
-        "failing_thread_name", ["SubscriptionRenewer", "StrategyTrigger"]
-    )
-    def test_start_rolls_back_when_worker_thread_cannot_start(
-        self, failing_thread_name
-    ):
-        client = _make_client(intervals=["1m"])
-        real_thread = threading.Thread
-        created_threads = []
-
-        def create_thread(*args, **kwargs):
-            kwargs["daemon"] = True
-            thread = real_thread(*args, **kwargs)
-            created_threads.append(thread)
-            if thread.name == failing_thread_name:
-                thread.start = MagicMock(side_effect=RuntimeError("can't start thread"))
-            return thread
-
-        with patch.object(
-            client,
-            "_send_request",
-            return_value=_request_ok([_make_candle(1)]),
-        ), patch("sk_zmq.client.threading.Thread", side_effect=create_thread):
-            assert client.start() is False
-            client.stop()
-
-        assert client.threads == []
-        assert list(client.candle_deques["1m"]) == []
-        assert all(not thread.is_alive() for thread in created_threads)
-        client.context.term.assert_called_once_with()
-
-    def test_renewer_counts_structured_request_failure(self):
-        client = _make_client(intervals=["1m"])
-
-        with patch.object(
-            client,
-            "_send_request",
-            return_value=_request_failure(GatewayRequestCode.INVALID_RESPONSE),
-        ), \
-            patch.object(type(client.stop_event), "wait", _FiniteWait(1)):
-            client._subscription_renewer_thread()
-
-        assert client.consecutive_renewal_failures == 1
-
-    def test_renewer_logs_bounded_sanitized_gateway_rejection_reason(self, caplog):
-        client = _make_client(intervals=["1m"])
-        result = GatewayRequestResult.failure(
-            GatewayRequestCode.GATEWAY_REJECTED,
-            response={
-                "status": "error",
-                "message": "  invalid\nsymbol\x00  " + ("x" * 250),
-            },
-        )
-
-        with caplog.at_level(logging.ERROR, logger="sk_zmq.client"), patch.object(
-            client, "_send_request", return_value=result
-        ), patch.object(type(client.stop_event), "wait", _FiniteWait(1)):
-            client._subscription_renewer_thread()
-
-        renewal_message = next(
-            record.getMessage()
-            for record in caplog.records
-            if "구독 갱신에 최종 실패" in record.getMessage()
-        )
-        detail = renewal_message.split("오류: ", 1)[1]
-        assert detail.startswith("gateway_rejected: invalid symbol")
-        assert "\n" not in detail
-        assert "\x00" not in detail
-        assert len(detail) <= len("gateway_rejected: ") + 200
-
     def test_renewer_does_not_count_failure_when_shutdown_starts_after_request(self):
         critical_calls = []
         client = _make_client(intervals=["1m"], on_critical=critical_calls.append)
@@ -1598,105 +374,39 @@ class TestLifecycleStartAndRenewal:
                 client.stop_event.set()
                 return False
 
-        with patch.object(
-            client,
-            "_send_request",
-            return_value=StopBeforeFailureClassification(),
-        ), patch.object(type(client.stop_event), "wait", _FiniteWait(1)):
+        with (
+            patch.object(
+                client,
+                "_send_request",
+                return_value=StopBeforeFailureClassification(),
+            ),
+            patch.object(type(client.stop_event), "wait", _FiniteWait(1)),
+        ):
             client._subscription_renewer_thread()
 
         assert client.consecutive_renewal_failures == 2
         assert critical_calls == []
 
-    def test_renewer_failures_increase_and_trigger_critical_callback(self):
-        critical_calls = []
-        client = _make_client(intervals=["1m"], on_critical=critical_calls.append)
-
-        with patch.object(client, "_send_request", return_value=_request_failure()), \
-            patch.object(type(client.stop_event), "wait", _FiniteWait(client.MAX_CONSECUTIVE_FAILURES)):
-            client._subscription_renewer_thread()
-
-        assert client.consecutive_renewal_failures == client.MAX_CONSECUTIVE_FAILURES
-        assert len(critical_calls) == 1
-        assert "연결이 끊겼" not in critical_calls[0]
-        assert "오류 코드" in critical_calls[0]
-
     def test_successful_renewal_after_failures_resets_counter(self):
-        responses = iter([
-            _request_failure(),
-            _request_failure(),
-            _request_ok(),
-        ])
+        responses = iter(
+            [
+                _request_failure(),
+                _request_failure(),
+                _request_ok(),
+            ]
+        )
         client = _make_client(intervals=["1m"])
 
         def pop_response(*_args, **_kwargs):
             return next(responses)
 
-        with patch.object(client, "_send_request", side_effect=pop_response), \
-            patch.object(type(client.stop_event), "wait", _FiniteWait(3)):
+        with (
+            patch.object(client, "_send_request", side_effect=pop_response),
+            patch.object(type(client.stop_event), "wait", _FiniteWait(3)),
+        ):
             client._subscription_renewer_thread()
 
         assert client.consecutive_renewal_failures == 0
-
-    def test_renewal_sends_history_count_1(self):
-        """Renewal thread must send history_count=1 (TTL extend only)."""
-        client = _make_client(intervals=["1m", "5m"])
-
-        renew_responses = [
-            _request_ok([_make_candle(1)]),
-            _request_ok([_make_candle(2)]),
-            _request_ok([_make_candle(1)]),
-            _request_ok([_make_candle(2)]),
-            _request_ok([_make_candle(1)]),
-            _request_ok([_make_candle(2)]),
-        ]
-
-        with patch.object(client, "_send_request", side_effect=renew_responses) as send_request, \
-             patch.object(type(client.stop_event), "wait", _FiniteWait(3)):
-            client._subscription_renewer_thread()
-
-        assert send_request.call_count == 6
-        for call in send_request.call_args_list:
-            req = call.args[0]
-            assert req["action"] == "subscribe_candle"
-            assert req["history_count"] == 1
-
-    def test_normal_renewal_start_is_debug_log(self, caplog):
-        client = _make_client(intervals=["1m"])
-
-        with caplog.at_level(logging.DEBUG, logger="sk_zmq.client"), \
-            patch.object(client, "_send_request", return_value=_request_ok()), \
-            patch.object(type(client.stop_event), "wait", _FiniteWait(1)):
-            client._subscription_renewer_thread()
-
-        renewal_records = [
-            record for record in caplog.records
-            if record.getMessage() == "모든 캔들 구독 갱신을 시작합니다..."
-        ]
-        assert len(renewal_records) == 1
-        assert renewal_records[0].levelno == logging.DEBUG
-
-    def test_stop_sends_unsubscribe_for_each_interval(self):
-        """stop() must send unsubscribe_candle for each subscribed interval."""
-        client = _make_client(intervals=["1m", "5m"])
-
-        with patch.object(
-            client, "_send_request", return_value=_request_failure()
-        ) as send_request:
-            client.stop()
-
-        assert send_request.call_count == 2
-        expected_actions = {"unsubscribe_candle", "unsubscribe_candle"}
-        actual_actions = {call.args[0]["action"] for call in send_request.call_args_list}
-        assert actual_actions == expected_actions
-
-        unsubscribe_calls = [call.args[0] for call in send_request.call_args_list]
-        intervals_sent = {c["interval"] for c in unsubscribe_calls}
-        assert intervals_sent == {"1m", "5m"}
-
-        for call in unsubscribe_calls:
-            assert call["symbol"] == "KRW-BTC"
-            assert call["exchange"] == "upbit"
 
     def test_stop_unsubscribes_after_in_flight_renewal(self):
         critical_calls = []
@@ -1735,8 +445,12 @@ class TestLifecycleStartAndRenewal:
                     both_unsubscribed.set()
             return _request_ok()
 
-        with patch.object(client.stop_event, "wait", side_effect=enter_one_renewal_cycle), \
-            patch.object(client, "_send_request", side_effect=send_request):
+        with (
+            patch.object(
+                client.stop_event, "wait", side_effect=enter_one_renewal_cycle
+            ),
+            patch.object(client, "_send_request", side_effect=send_request),
+        ):
             renewer = threading.Thread(target=client._subscription_renewer_thread)
             renewer.start()
             assert first_renewal_started.wait(timeout=1)
@@ -1758,3 +472,704 @@ class TestLifecycleStartAndRenewal:
         ]
         assert client.consecutive_renewal_failures == 0
         assert critical_calls == []
+
+
+@pytest.mark.parametrize("interval", ["10m", "1d", "1s", "2m"])
+def test_reject_unsupported_aggregated_intervals(interval):
+    with pytest.raises(ValueError):
+        _make_client(intervals=[interval])
+
+
+@pytest.mark.parametrize("mode", ["live", "deque_copy", "deep_copy"])
+def test_callback_mutation_semantics(mode):
+    client = _make_client(callback_snapshot_mode=mode)
+    _inject_update(client, "1m", _make_candle(1))
+    payload = client._build_callback_payload()
+    payload["1m"][0]["close"] = 123
+    assert client.candle_deques["1m"][0]["close"] == (
+        100 if mode == "deep_copy" else 123
+    )
+    payload["1m"].clear()
+    assert len(client.candle_deques["1m"]) == (0 if mode == "live" else 1)
+
+
+def test_event_integrity_and_late_messages():
+    client = _make_client(intervals=["1m", "15m"])
+    _inject_update(client, "1m", _make_candle(1))
+    _inject_close(client, "1m", _make_candle(1, 101), _make_candle(2))
+    _inject_update(client, "1m", _make_candle(3))
+    client.data_updated_event.clear()
+    client._handle_candle_event(
+        "UPBIT:CANDLE:KRW-BTC:1m:UPDATE",
+        dict(candle=_make_candle(1, 90), stream_id=STREAM, seq=1),
+    )
+    client._handle_candle_event(
+        "UPBIT:CANDLE:KRW-BTC:1m:CLOSE",
+        dict(
+            candle=_make_candle(1, 90), new=_make_candle(2, 90), stream_id=STREAM, seq=2
+        ),
+    )
+    _inject_reconcile(client, "1m", _make_candle(999))
+    assert not client.data_updated_event.is_set()
+    assert [c["ts"] for c in client.candle_deques["1m"]] == [1, 2, 3]
+    assert client.candle_deques["1m"][0]["close"] == 101
+    _inject_reconcile(client, "1m", _make_candle(1, 102))
+    assert client.candle_deques["1m"][0]["close"] == 102
+    assert client.data_updated_event.is_set()
+    assert not client.candle_deques["15m"]
+
+
+@pytest.mark.parametrize(
+    ("topic", "payload"),
+    [
+        ("BINANCE:CANDLE:KRW-BTC:1m:UPDATE", {"candle": {"ts": 1}}),
+        ("UPBIT:CANDLE:KRW-ETH:1m:UPDATE", {"candle": {"ts": 1}}),
+        ("UPBIT:TRADE:KRW-BTC:1m:UPDATE", {"candle": {"ts": 1}}),
+        ("UPBIT:CANDLE:KRW-BTC:5m:UPDATE", {"candle": {"ts": 1}}),
+        ("UPBIT:CANDLE:KRW-BTC:1m:UPDATE", {"candle": {"ts": "bad"}}),
+        ("UPBIT:CANDLE:KRW-BTC:1m:UPDATE", {"candle": {}}),
+        ("UPBIT:CANDLE:KRW-BTC:1m:CLOSE", {"candle": {"ts": 1}}),
+        ("UPBIT:CANDLE:KRW-BTC:1m:CLOSE", {"candle": {"ts": 2}, "new": {"ts": 1}}),
+        ("UPBIT:CANDLE:KRW-BTC:1m:UNKNOWN", {"candle": {"ts": 1}}),
+    ],
+)
+def test_ignore_unrelated_or_malformed_event(topic, payload):
+    client = _make_client()
+    client._handle_candle_event(topic, dict(payload, stream_id=STREAM, seq=1))
+    assert not client.candle_deques["1m"]
+    assert not client.data_updated_event.is_set()
+
+
+def test_snapshot_merges_live_close_without_duplicate_or_regression():
+    client = _make_client()
+    client._request_resync()
+
+    def snapshot(request):
+        _inject_update(client, "1m", _make_candle(2, 102))
+        _inject_close(client, "1m", _make_candle(2, 103), _make_candle(3, 103))
+        client._handle_candle_event(
+            "UPBIT:CANDLE:KRW-BTC:1m:UPDATE",
+            dict(candle=_make_candle(2, 99), stream_id=STREAM, seq=1),
+        )
+        return _request_ok([_make_candle(1), _make_candle(2)])
+
+    with patch.object(client, "_send_request", side_effect=snapshot):
+        assert client._load_snapshots()
+    assert [c["ts"] for c in client.candle_deques["1m"]] == [1, 2, 3]
+    assert [c["close"] for c in client.candle_deques["1m"]] == [100, 103, 103]
+
+
+def test_failed_recovery_preserves_storage_and_retries_buffer():
+    client = _make_client()
+    _inject_update(client, "1m", _make_candle(1))
+    client._handle_candle_event(
+        "UPBIT:CANDLE:KRW-BTC:1m:RESYNC_REQUIRED", _event_payload(client, reason="gap")
+    )
+    _inject_update(client, "1m", _make_candle(3, 103))
+    with patch.object(client, "_send_request", return_value=_request_failure()):
+        assert not client._load_snapshots()
+    assert [c["ts"] for c in client.candle_deques["1m"]] == [1]
+    with patch.object(
+        client,
+        "_send_request",
+        return_value=_request_ok([_make_candle(2)], snapshot_seq=2),
+    ):
+        assert client._load_snapshots()
+    assert [c["ts"] for c in client.candle_deques["1m"]] == [2, 3]
+
+
+def test_buffer_overflow_or_new_resync_invalidates_inflight_snapshot():
+    client = _make_client()
+    client._MAX_PENDING_EVENTS = 1
+    client._request_resync()
+
+    def snapshot(request):
+        _inject_update(client, "1m", _make_candle(2))
+        _inject_update(client, "1m", _make_candle(3))
+        return _request_ok([_make_candle(1)])
+
+    with patch.object(client, "_send_request", side_effect=snapshot):
+        assert not client._load_snapshots()
+    assert not client.candle_deques["1m"]
+    with patch.object(
+        client, "_send_request", return_value=_request_ok([_make_candle(2)])
+    ):
+        assert client._load_snapshots()
+    assert [c["ts"] for c in client.candle_deques["1m"]] == [2, 3]
+
+
+def test_trigger_releases_lock_and_survives_callback_error():
+    calls = []
+    done = threading.Event()
+
+    def callback(payload):
+        assert client.storage_lock.acquire(blocking=False)
+        client.storage_lock.release()
+        calls.append(payload["1m"][-1]["ts"])
+        if len(calls) == 1:
+            raise RuntimeError("user callback error")
+        done.set()
+
+    client = _make_client(callback=callback, throttle_seconds=0.01)
+    worker = threading.Thread(target=client._strategy_trigger_thread)
+    worker.start()
+    try:
+        _inject_update(client, "1m", _make_candle(1))
+        deadline = time.monotonic() + 2
+        while not calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        _inject_update(client, "1m", _make_candle(2))
+        assert done.wait(2)
+        assert calls == [1, 2]
+    finally:
+        client.stop_event.set()
+        worker.join(2)
+
+
+@pytest.mark.parametrize(
+    "failure", [_request_failure(), _request_ok([]), _request_ok([{}])]
+)
+def test_start_failure_leaves_no_threads_or_partial_data(failure):
+    client = _make_client(intervals=["1m", "15m"])
+    client.context.socket.return_value.get_monitor_socket.return_value.poll.return_value = False
+    client.context.socket.return_value.poll.return_value = False
+    with patch.object(
+        client, "_send_request", side_effect=[_request_ok([_make_candle(1)]), failure]
+    ):
+        assert not client.start()
+    assert not client.threads
+    assert all(not candles for candles in client.candle_deques.values())
+    client.context.socket.return_value.close.assert_called_once()
+
+
+class _RecordingWait:
+    def __init__(self):
+        self.timeouts = []
+
+    def __call__(self, timeout=None):
+        self.timeouts.append(timeout)
+        return True
+
+
+@pytest.mark.parametrize("recovery", ["control", "reconnect", "restart"])
+def test_real_socket_startup_and_recovery_handoff(recovery):
+    """PUB events arriving before REP snapshots survive startup and recovery."""
+    import orjson
+
+    context = zmq.Context()
+    ready = threading.Event()
+    live_received = threading.Event()
+    recovered = threading.Event()
+    server_done = threading.Event()
+    ports = []
+    errors = []
+    requests = []
+
+    def server():
+        rep = context.socket(zmq.REP)
+        pub = context.socket(zmq.XPUB)
+        rep.setsockopt(zmq.RCVTIMEO, 3000)
+        pub.setsockopt(zmq.RCVTIMEO, 3000)
+        ports.extend(
+            [
+                rep.bind_to_random_port("tcp://127.0.0.1"),
+                pub.bind_to_random_port("tcp://127.0.0.1"),
+            ]
+        )
+        ready.set()
+        try:
+            first = orjson.loads(rep.recv())
+            requests.append(first)
+            # XPUB confirms the listener subscribed before the snapshot is released.
+            assert pub.recv().startswith(b"\x01UPBIT:CANDLE:KRW-BTC:15m:")
+            pub.send_multipart([b"UPBIT:CANDLE:KRW-BTC:15m:UPDATE", b"invalid-json"])
+            pub.send_multipart([b"UPBIT:CANDLE:KRW-BTC:15m:UPDATE"])
+            pub.send_multipart(
+                [
+                    b"UPBIT:CANDLE:KRW-BTC:15m:CLOSE",
+                    orjson.dumps(
+                        {
+                            "candle": _make_candle(2, 102),
+                            "new": _make_candle(3, 103),
+                            "stream_id": STREAM,
+                            "seq": 10,
+                        }
+                    ),
+                ]
+            )
+            assert live_received.wait(2)
+            rep.send(
+                orjson.dumps(
+                    {
+                        "status": "ok",
+                        "data": [_make_candle(1), _make_candle(2)],
+                        "stream_id": STREAM,
+                        "snapshot_seq": 9,
+                    }
+                )
+            )
+            assert begin_recovery.wait(2)
+            live_received.clear()
+            if recovery == "control":
+                pub.send_multipart(
+                    [
+                        b"UPBIT:CANDLE:KRW-BTC:15m:RESYNC_REQUIRED",
+                        orjson.dumps(
+                            {
+                                "type": "RESYNC_REQUIRED",
+                                "reason": "gap",
+                                "stream_id": STREAM,
+                                "seq": 11,
+                            }
+                        ),
+                    ]
+                )
+            elif recovery == "restart":
+                pub.send_multipart(
+                    [
+                        b"UPBIT:CANDLE:KRW-BTC:15m:UPDATE",
+                        orjson.dumps(
+                            {"candle": _make_candle(4), "stream_id": RESTART, "seq": 1}
+                        ),
+                    ]
+                )
+            else:
+                pub.close(0)
+                pub = context.socket(zmq.XPUB)
+                pub.setsockopt(zmq.RCVTIMEO, 3000)
+                pub.bind(f"tcp://127.0.0.1:{ports[1]}")
+                assert pub.recv().startswith(b"\x01UPBIT:CANDLE:KRW-BTC:15m:")
+            request = orjson.loads(rep.recv())
+            requests.append(request)
+            pub.send_multipart(
+                [
+                    b"UPBIT:CANDLE:KRW-BTC:15m:CLOSE",
+                    orjson.dumps(
+                        {
+                            "candle": _make_candle(4, 104),
+                            "new": _make_candle(5, 105),
+                            "stream_id": RESTART if recovery == "restart" else STREAM,
+                            "seq": 2 if recovery == "restart" else 13,
+                        }
+                    ),
+                ]
+            )
+            assert live_received.wait(2)
+            rep.send(
+                orjson.dumps(
+                    {
+                        "status": "ok",
+                        "data": [_make_candle(3, 130), _make_candle(4)],
+                        "stream_id": RESTART if recovery == "restart" else STREAM,
+                        "snapshot_seq": 1 if recovery == "restart" else 12,
+                    }
+                )
+            )
+            requests.append(orjson.loads(rep.recv()))
+            rep.send(orjson.dumps({"status": "ok"}))
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            rep.close(0)
+            pub.close(0)
+            server_done.set()
+
+    begin_recovery = threading.Event()
+    gateway = threading.Thread(target=server)
+    gateway.start()
+    assert ready.wait(2)
+
+    def callback(payload):
+        if payload["15m"] and payload["15m"][-1]["ts"] == 5:
+            recovered.set()
+
+    client = ZMQClient(
+        client_id="integration",
+        symbol="KRW-BTC",
+        intervals=["15m"],
+        candle_handler_callback=callback,
+        throttle_seconds=0.01,
+        zmq_gateway_host="127.0.0.1",
+        zmq_gateway_req_port=ports[0],
+        zmq_gateway_pub_port=ports[1],
+    )
+    original = client._handle_candle_event
+
+    def receive(topic, payload):
+        original(topic, payload)
+        if topic.endswith(":CLOSE"):
+            live_received.set()
+
+    try:
+        with patch.object(client, "_handle_candle_event", side_effect=receive):
+            assert client.start()
+            assert [c["ts"] for c in client._build_callback_payload()["15m"]] == [
+                1,
+                2,
+                3,
+            ]
+            begin_recovery.set()
+            assert recovered.wait(3)
+            candles = list(client._build_callback_payload()["15m"])
+            assert [c["ts"] for c in candles] == [3, 4, 5]
+            assert [c["close"] for c in candles] == [130, 104, 105]
+            client.stop()
+            client.stop()
+        assert server_done.wait(3)
+        assert not errors
+        assert [r["action"] for r in requests] == [
+            "subscribe_candle",
+            "subscribe_candle",
+            "unsubscribe_candle",
+        ]
+        assert all(
+            r["interval"] == "15m" and r["exchange"] == "upbit" for r in requests
+        )
+        assert all(not thread.is_alive() for thread in client.threads)
+    finally:
+        if not client.stop_event.is_set():
+            with patch.object(client, "_send_request", return_value=_request_failure()):
+                client.stop()
+        gateway.join(4)
+        context.term()
+
+
+def test_sequence_merges_equal_volume_updates_and_discards_snapshot_covered_events():
+    client = _make_client()
+    client._request_resync()
+    topic = "UPBIT:CANDLE:KRW-BTC:1m:UPDATE"
+    for stream_id, seq, close in [
+        (STREAM, 12, 112),
+        (STREAM, 9, 99),
+        (RESTART, 100, 999),
+        (STREAM, 11, 111),
+        (STREAM, 12, 90),
+    ]:
+        client._handle_candle_event(
+            topic, dict(candle=_make_candle(2, close), stream_id=stream_id, seq=seq)
+        )
+    snapshot = _make_candle(2, 110)
+    with patch.object(
+        client, "_send_request", return_value=_request_ok([snapshot], snapshot_seq=10)
+    ):
+        assert client._load_snapshots()
+    assert client.candle_deques["1m"][-1]["close"] == 112
+    client.data_updated_event.clear()
+    # Covered and duplicate events cannot mutate storage or trigger a callback.
+    for seq in (10, 11, 12):
+        client._handle_candle_event(
+            topic, dict(candle=_make_candle(2, 90), stream_id=STREAM, seq=seq)
+        )
+    assert not client.data_updated_event.is_set()
+    # A later sequence is authoritative even when volume decreases.
+    latest = _make_candle(2, 113)
+    latest["volume"] = 0
+    client._handle_candle_event(topic, dict(candle=latest, stream_id=STREAM, seq=13))
+    assert client.candle_deques["1m"][-1] == latest
+
+
+def test_stale_snapshot_does_not_regress_existing_sequence():
+    client = _make_client()
+    _inject_update(client, "1m", _make_candle(3))
+    client._request_resync()
+    with patch.object(
+        client,
+        "_send_request",
+        return_value=_request_ok([_make_candle(2)], snapshot_seq=0),
+    ):
+        assert not client._load_snapshots()
+    assert [c["ts"] for c in client.candle_deques["1m"]] == [3]
+
+
+def test_renewal_failures_trigger_critical_and_preserve_history():
+    critical = []
+    client = _make_client(on_critical=critical.append)
+    _inject_update(client, "1m", _make_candle(1))
+    with (
+        patch.object(client, "_send_request", return_value=_request_failure()),
+        patch.object(
+            type(client.stop_event),
+            "wait",
+            _FiniteWait(client.MAX_CONSECUTIVE_FAILURES),
+        ),
+    ):
+        client._subscription_renewer_thread()
+    assert len(critical) == 1
+    assert [c["ts"] for c in client.candle_deques["1m"]] == [1]
+
+
+def test_stop_during_startup_cancels_publication_and_joins_listener():
+    client = _make_client()
+    socket = client.context.socket.return_value
+    socket.get_monitor_socket.return_value.poll.return_value = False
+    socket.poll.return_value = False
+    request_entered = threading.Event()
+    release_request = threading.Event()
+    results = []
+    actions = []
+
+    def request(data, **kwargs):
+        actions.append(data["action"])
+        if data["action"] == "subscribe_candle":
+            request_entered.set()
+            assert release_request.wait(2)
+        return _request_ok([_make_candle(1)])
+
+    with patch.object(client, "_send_request", side_effect=request):
+        starter = threading.Thread(target=lambda: results.append(client.start()))
+        starter.start()
+        assert request_entered.wait(2)
+        stopper = threading.Thread(target=client.stop)
+        stopper.start()
+        assert client.stop_event.wait(1)
+        release_request.set()
+        starter.join(2)
+        stopper.join(2)
+    assert not starter.is_alive() and not stopper.is_alive()
+    assert results == [False]
+    assert not client.candle_deques["1m"]
+    assert actions == ["subscribe_candle", "unsubscribe_candle"]
+    socket.close.assert_called_once()
+    client.context.term.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "worker", ["SubscriptionRenewer", "StrategyTrigger", "CandleRecovery"]
+)
+def test_worker_start_failure_rolls_back_without_orphan_threads(worker):
+    client = _make_client()
+    socket = client.context.socket.return_value
+    socket.get_monitor_socket.return_value.poll.return_value = False
+    socket.poll.return_value = False
+    real_thread = threading.Thread
+    created = []
+
+    def thread_factory(*args, **kwargs):
+        thread = real_thread(*args, **kwargs)
+        created.append(thread)
+        if thread.name == worker:
+            thread.start = MagicMock(side_effect=RuntimeError("cannot start"))
+        return thread
+
+    with (
+        patch.object(
+            client, "_send_request", return_value=_request_ok([_make_candle(1)])
+        ),
+        patch("sk_zmq.client.threading.Thread", side_effect=thread_factory),
+    ):
+        assert not client.start()
+        client.stop()
+    assert all(not thread.is_alive() for thread in created)
+    assert not client.candle_deques["1m"]
+    client.context.term.assert_called_once()
+
+
+def test_restart_resnapshots_all_intervals_without_comparing_runtime_counters():
+    client = _make_client(intervals=["1m", "15m"])
+    client._request_resync()
+    with patch.object(
+        client,
+        "_send_request",
+        return_value=_request_ok([_make_candle(1)], snapshot_seq=100),
+    ):
+        assert client._load_snapshots()
+    # New runtime seq=1 must not be discarded against old runtime seq=100.
+    client._handle_candle_event(
+        "UPBIT:CANDLE:KRW-BTC:1m:UPDATE",
+        dict(candle=_make_candle(2, 102), stream_id=RESTART, seq=1),
+    )
+    with patch.object(
+        client,
+        "_send_request",
+        return_value=_request_ok([_make_candle(1)], snapshot_seq=101),
+    ):
+        assert not client._load_snapshots()
+    assert all(c[-1]["ts"] == 1 for c in client.candle_deques.values())
+    with patch.object(
+        client,
+        "_send_request",
+        return_value=_request_ok(
+            [_make_candle(2, 100)], stream_id=RESTART, snapshot_seq=0
+        ),
+    ) as request:
+        assert client._load_snapshots()
+    assert {call.args[0]["interval"] for call in request.call_args_list} == {
+        "1m",
+        "15m",
+    }
+    assert client.candle_deques["1m"][-1]["close"] == 102
+    assert client.candle_deques["15m"][-1]["close"] == 100
+    client.data_updated_event.clear()
+    client._handle_candle_event(
+        "UPBIT:CANDLE:KRW-BTC:1m:UPDATE",
+        dict(candle=_make_candle(3, 999), stream_id=STREAM, seq=1000),
+    )
+    assert not client.data_updated_event.is_set()
+    assert client.candle_deques["1m"][-1]["ts"] == 2
+    client._handle_candle_event(
+        "UPBIT:CANDLE:KRW-BTC:1m:UPDATE",
+        dict(candle=_make_candle(2, 103), stream_id=RESTART, seq=2),
+    )
+    assert client.candle_deques["1m"][-1]["close"] == 103
+
+
+def test_control_after_snapshot_boundary_requires_new_snapshot():
+    client = _make_client()
+    client._request_resync()
+    client._handle_candle_event(
+        "UPBIT:CANDLE:KRW-BTC:1m:RESYNC_REQUIRED", dict(stream_id=STREAM, seq=11)
+    )
+    with patch.object(
+        client,
+        "_send_request",
+        return_value=_request_ok([_make_candle(1)], snapshot_seq=10),
+    ):
+        assert not client._load_snapshots()
+    assert not client.candle_deques["1m"]
+    with patch.object(
+        client,
+        "_send_request",
+        return_value=_request_ok([_make_candle(2)], snapshot_seq=11),
+    ):
+        assert client._load_snapshots()
+    client.data_updated_event.clear()
+    # A duplicate control notice must not restart recovery.
+    client._handle_candle_event(
+        "UPBIT:CANDLE:KRW-BTC:1m:RESYNC_REQUIRED", dict(stream_id=STREAM, seq=11)
+    )
+    client._handle_candle_event(
+        "UPBIT:CANDLE:KRW-BTC:1m:UPDATE",
+        dict(candle=_make_candle(2, 102), stream_id=STREAM, seq=12),
+    )
+    assert client.candle_deques["1m"][-1]["close"] == 102
+
+
+def test_restart_detected_by_renewal_keeps_data_until_full_snapshot():
+    client = _make_client(intervals=["1m", "15m"])
+    client._request_resync()
+    with patch.object(
+        client,
+        "_send_request",
+        return_value=_request_ok([_make_candle(1)], snapshot_seq=100),
+    ):
+        assert client._load_snapshots()
+    with (
+        patch.object(
+            client,
+            "_send_request",
+            return_value=_request_ok(
+                [_make_candle(2)], stream_id=RESTART, snapshot_seq=1
+            ),
+        ),
+        patch.object(type(client.stop_event), "wait", _FiniteWait(1)),
+    ):
+        client._subscription_renewer_thread()
+    assert all(c[-1]["ts"] == 1 for c in client.candle_deques.values())
+    with patch.object(
+        client,
+        "_send_request",
+        return_value=_request_ok([_make_candle(2)], stream_id=RESTART, snapshot_seq=1),
+    ) as request:
+        assert client._load_snapshots()
+    assert request.call_count == 2
+    assert all(c[-1]["ts"] == 2 for c in client.candle_deques.values())
+
+
+def test_snapshot_restart_during_one_interval_recovery_expands_to_all():
+    client = _make_client(intervals=["1m", "15m"])
+    client._request_resync()
+    with patch.object(
+        client,
+        "_send_request",
+        return_value=_request_ok([_make_candle(1)], snapshot_seq=100),
+    ):
+        assert client._load_snapshots()
+    client._handle_candle_event(
+        "UPBIT:CANDLE:KRW-BTC:1m:RESYNC_REQUIRED", dict(stream_id=STREAM, seq=101)
+    )
+    with patch.object(
+        client,
+        "_send_request",
+        return_value=_request_ok([_make_candle(2)], stream_id=RESTART, snapshot_seq=0),
+    ) as request:
+        assert not client._load_snapshots()
+        assert client._load_snapshots()
+    assert request.call_count == 3  # one interval, then both after detecting restart
+    assert all(c[-1]["ts"] == 2 for c in client.candle_deques.values())
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {},
+        {"stream_id": STREAM},
+        {"stream_id": "", "snapshot_seq": 1},
+        {"stream_id": STREAM, "snapshot_seq": -1},
+        {"stream_id": STREAM, "snapshot_seq": True},
+    ],
+)
+def test_missing_or_invalid_snapshot_boundary_cannot_publish_history(metadata):
+    client = _make_client()
+    client._request_resync()
+    result = GatewayRequestResult.success(
+        data=[_make_candle(1)], response=dict(status="ok", **metadata)
+    )
+    with patch.object(client, "_send_request", return_value=result):
+        assert not client._load_snapshots()
+    assert not client.candle_deques["1m"]
+
+
+def test_live_sequence_upserts_timestamp_without_replacing_newer_bucket():
+    client = _make_client()
+    _inject_close(client, "1m", _make_candle(1), _make_candle(2))
+    _inject_update(client, "1m", _make_candle(1, 101))
+    assert [c["ts"] for c in client.candle_deques["1m"]] == [1, 2]
+    assert client.candle_deques["1m"][0]["close"] == 101
+
+
+def test_restart_during_snapshot_request_invalidates_old_runtime_response():
+    client = _make_client()
+    client._request_resync()
+    with patch.object(
+        client,
+        "_send_request",
+        return_value=_request_ok([_make_candle(1)], snapshot_seq=100),
+    ):
+        assert client._load_snapshots()
+    client._request_resync()
+
+    def restarting_snapshot(request):
+        client._handle_candle_event(
+            "UPBIT:CANDLE:KRW-BTC:1m:UPDATE",
+            dict(candle=_make_candle(2, 102), stream_id=RESTART, seq=1),
+        )
+        return _request_ok([_make_candle(3)], snapshot_seq=101)
+
+    with patch.object(client, "_send_request", side_effect=restarting_snapshot):
+        assert not client._load_snapshots()
+    assert client.candle_deques["1m"][-1]["ts"] == 1
+    with patch.object(
+        client,
+        "_send_request",
+        return_value=_request_ok([_make_candle(2)], stream_id=RESTART, snapshot_seq=0),
+    ):
+        assert client._load_snapshots()
+    assert client.candle_deques["1m"][-1]["close"] == 102
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {},
+        {"stream_id": STREAM, "seq": True},
+        {"stream_id": STREAM, "seq": -1},
+        {"stream_id": "", "seq": 1},
+    ],
+)
+def test_unordered_events_cannot_mutate_candles_or_trigger_recovery(metadata):
+    client = _make_client()
+    client._handle_candle_event(
+        "UPBIT:CANDLE:KRW-BTC:1m:UPDATE", dict(candle=_make_candle(1), **metadata)
+    )
+    assert not client.candle_deques["1m"]
+    assert not client.data_updated_event.is_set()
