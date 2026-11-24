@@ -2,6 +2,35 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.0] - 2026-11-24
+
+### Changed
+
+- Split configuration, gateway transport, candle state, and pure protocol
+  validation into focused modules while retaining the constructor and gateway wire protocol.
+- Replace ambiguous internal names, mixed-language emoji logs, and duplicated
+  documentation with explicit lifecycle, recovery, and data-ownership terms.
+- Add a public lifecycle state, safe candle snapshot access, and context-manager
+  support.
+- Split tests by responsibility and add constructor, protocol, and public API
+  coverage.
+- Add locked Ruff, Pyright, 90% coverage, build, and GitHub Actions quality gates.
+- Mark the wheel as typed with a PEP 561 `py.typed` marker.
+
+### Migration
+
+- Worker threads and synchronization primitives are internal. Replace reads of
+  `client.threads` with `client.is_running`; after external `stop()` returns,
+  check `client.state is ClientState.STOPPED` if explicit confirmation is needed.
+- Invalid configuration now fails at construction. Critical renewal alerts are
+  sent when the failure threshold is reached, not on every subsequent failed cycle.
+
+### Fixed
+
+- Keep new recovery requests signaled when they race with a snapshot commit.
+- Preserve pending callback notifications through recovery even if the recovered
+  candle contents are unchanged.
+
 ## [0.2.1] - 2026-10-14
 
 ### Fixed

@@ -1,3 +1,3 @@
-from .client import ZMQClient
+from .client import ClientState, ZMQClient
 
-__all__ = ["ZMQClient"]
+__all__ = ["ClientState", "ZMQClient"]
