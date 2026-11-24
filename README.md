@@ -1,35 +1,31 @@
 # sk-zmq
 
-Reusable ZMQ client for aggregated candle stream subscriptions (version 0.2.1).
+`sk-zmq` is a threaded ZeroMQ client for ordered, recoverable candle streams.
+It owns gateway requests, subscription renewal, live event ingestion, snapshot
+recovery, bounded in-memory candle storage, and callback delivery. It does not
+contain trading strategy, order, or account logic.
 
-This package provides only ZMQ communication, TTL renewal, and event listening.
-It does not include any trading logic.
+Python 3.10 or newer is required.
 
 ## Install
 
-```bash
-pip install -e .
-```
-
-For development checks:
+From a checkout:
 
 ```bash
-uv run --group dev pytest -q
-uv build
+python -m pip install .
 ```
 
-## Usage
+For development:
 
-A compatible candle gateway must already be running at the configured host and
-ports. `start()` returns `False` if an initial snapshot cannot be loaded or the
-local SUB listener cannot be initialized.
+```bash
+uv sync --group dev
+```
 
-Supported aggregated intervals: `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `4h`.
-`10m`, `1d`, and native `1s` streams are not accepted by this client.
-Construction fails immediately if `intervals` is empty or
-`candle_deque_maxlen` is not greater than zero.
-`candle_deque_maxlen` may exceed 200; initial gateway history is capped at 200
-while the local deque continues growing up to the configured maximum.
+## Use the client
+
+A compatible gateway must already expose the request and publish ports.
+`start()` returns `False` when the subscriber or initial snapshots cannot be
+prepared. The context-manager form raises `RuntimeError` instead.
 
 ```python
 import time
@@ -37,151 +33,139 @@ import time
 from sk_zmq import ZMQClient
 
 
-def on_candle_update(candle_deques):
-    latest = {
+def handle_candles(candles_by_interval):
+    latest_by_interval = {
         interval: candles[-1] if candles else None
-        for interval, candles in candle_deques.items()
+        for interval, candles in candles_by_interval.items()
     }
-    print(latest)
-
-
-def on_critical(msg: str):
-    # Handle critical alerts here
-    print(msg)
+    print(latest_by_interval)
 
 
 client = ZMQClient(
-    client_id="my-client",
+    client_id="analytics-worker",
     symbol="KRW-BTC",
     intervals=["1m", "5m", "15m"],
-    candle_handler_callback=on_candle_update,
-    throttle_seconds=0.1,
+    candle_handler_callback=handle_candles,
+    exchange="upbit",
     zmq_gateway_host="127.0.0.1",
     zmq_gateway_req_port=11556,
     zmq_gateway_pub_port=11558,
     server_candle_ttl=300,
-    candle_deque_maxlen=200,
-    on_critical=on_critical,
-    callback_snapshot_mode="deque_copy",  # "live", "deque_copy", "deep_copy"
-    exchange="upbit",
+    candle_deque_maxlen=500,
+    callback_snapshot_mode="deque_copy",
 )
 
 try:
     if not client.start():
-        raise RuntimeError(
-            "Could not start the ZMQ client. Check the gateway request/PUB "
-            "addresses, ports, exchange, symbol, and intervals."
-        )
-    while True:
+        raise RuntimeError("Could not initialize the candle stream")
+    while client.is_running:
         time.sleep(1)
-except KeyboardInterrupt:
-    pass
 finally:
     client.stop()
 ```
 
-## Exchange and payload expectations
+`stop()` is idempotent and waits for owned workers and in-flight subscription
+requests when called from outside the client's workers. Always call it in
+`finally`, or use the client as a context manager.
 
-`exchange` selects the candle topic prefix used by the client.
+`is_running` checks lifecycle state and worker liveness, not stream freshness
+or gateway availability. For explicit shutdown confirmation, inspect
+`client.state is ClientState.STOPPED` (import `ClientState` from `sk_zmq`).
 
-For example, `exchange="upbit"` subscribes to:
+### Upgrading from 0.2.1
 
-`UPBIT:CANDLE:{symbol}:{interval}:`
+The constructor, callbacks, supported intervals, and gateway wire format remain
+compatible. Internal worker threads and synchronization objects are no longer
+public; replace `client.threads` liveness checks with `client.is_running` and
+rely on external `stop()` for worker cleanup. See [CHANGELOG.md](CHANGELOG.md)
+for behavior changes.
 
-Use `exchange="binance"` with a canonical symbol such as `USDT-BTC` for Binance.
-The broadcaster runs both providers and routes requests using `exchange`.
-`ZMQClient` consumes the aggregated `subscribe_candle` product, with its fixed
-candle topic prefix. It does not subscribe to normalized raw/native streams or
-provide HTTP REST wrappers. Raw stream consumers must use the exact `topic`
-returned by `subscribe`; orderbook options identify separate leases and topics.
-REST daily/week/month candles remain separate provider-native capabilities.
+## Configuration contract
 
-The gateway publishes `UPDATE`, `CLOSE`, and `RECONCILE` envelopes with `candle`
-(and `new` for CLOSE). Candle `ts` is the bucket open time in epoch milliseconds.
-Every event, including `RESYNC_REQUIRED`, carries `stream_id` (provider runtime
-identity) and `seq` (monotonically increasing provider publication counter).
-Candle rows are upserted by `ts` and kept sorted; CLOSE does not duplicate a bucket
-or replace a different newer bucket. Freshness is determined by sequence, so later
-same-bucket events can change price at equal volume or reduce volume. RECONCILE
-replaces a stored timestamp; a missing timestamp is ignored. Unknown, malformed,
-unsequenced, duplicate and stale events are ignored.
+Supported aggregated intervals are `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, and
+`4h`. Empty or unsupported interval lists are rejected before a ZMQ context is
+allocated. Client identifiers, symbols, exchange names, and hosts must be
+non-empty. Ports must be in the TCP port range; TTL and deque capacity must be
+positive; throttle values must be finite and non-negative.
 
-## Startup, recovery, and leases
+The initial gateway history request is capped at 200 rows. A larger
+`candle_deque_maxlen` still allows the local deque to grow to its configured
+capacity as live events arrive.
 
-`start()` prepares and runs the SUB listener before requesting snapshots for all
-intervals. Successful `subscribe_candle` responses must carry `stream_id` and
-`snapshot_seq`, captured atomically with the candle data by the gateway. The client
-installs that history and boundary, then replays only matching-runtime buffered
-events with `seq > snapshot_seq`, in ascending sequence order. Same-runtime
-sequences already applied or covered by the snapshot are discarded. Counters are
-provider-wide, so sequence gaps between this client's intervals are normal.
-Snapshot history is sorted and deduplicated. Callback and
-renewal workers begin only after startup succeeds. A failed startup stops the
-listener and leaves no partial history; call `stop()` in `finally` to release
-leases and the context, as in the example above.
+## Stream contract
 
-An interval's fresh `RESYNC_REQUIRED` event or a SUB transport disconnect pauses
-callback delivery while live events are buffered. A different `stream_id` in live
-events or renewal responses requires fresh snapshots for all intervals; counters
-from separate runtimes are never compared. Events from a replaced runtime are
-ignored. A restart discovered during an interval recovery expands recovery to all
-intervals before publishing any new state. After reconnect, the client
-reloads snapshots and merges buffered events before resuming callbacks. Recovery
-requests use the same exchange, symbol, and interval as the original lease.
-Failed recovery requests retain stored data and retry; `on_critical` reports
-failed recovery attempts. Storage read directly during recovery is the last
-known state. Each interval buffers at most 10,000 events; overflow invalidates
-the in-flight snapshot and requires another snapshot instead of silently
-accepting incomplete history. A further recovery notice also invalidates an
-in-flight snapshot when it is not covered by the snapshot boundary. Missing
-ordering metadata fails snapshot loading; there is no compatibility fallback to
-volume or timestamp freshness. A same-runtime snapshot older than already applied
-sequence state is rejected.
+For `exchange="upbit"`, the client subscribes to topics with this prefix:
 
-Renewal uses `subscribe_candle` with `history_count=1` every half TTL and keeps
-existing stored history. Set `server_candle_ttl` to the server's lease TTL.
-`stop()` waits for in-flight subscription requests before unsubscribing each
-unique interval, joins workers, and terminates the ZMQ context. Repeated calls
-are safe. The broadcaster uses shared leases, so clients sharing the same
-exchange/symbol/interval must coordinate explicit unsubscription.
+```text
+UPBIT:CANDLE:{symbol}:{interval}:
+```
 
-PUB/SUB provides no durable replay or per-consumer acknowledgement. This client
-recovers from transport disconnects, runtime changes and explicit recovery notices.
-The sequence contract orders equal-volume updates and snapshot handoff, but does
-not prove delivery of every publication or provide durable replay. RECONCILE and
-recovery snapshots supply authoritative corrections.
+The gateway may publish `UPDATE`, `CLOSE`, `RECONCILE`, and `RESYNC_REQUIRED`.
+Every publication must include a non-empty `stream_id` and a non-negative integer
+`seq`. Successful snapshot responses must include the same runtime identity and
+`snapshot_seq` boundary.
 
-## Callback snapshot modes
+The client applies these rules:
 
-The callback now runs outside the internal storage lock.
-Depending on your needs, choose how data is passed into the callback:
+- `seq` is authoritative within one `stream_id`; duplicate and stale events are
+  ignored.
+- Counters from different runtimes are never compared.
+- Candle rows are upserted by the bucket-open timestamp `ts` and remain sorted.
+- `RECONCILE` only replaces a timestamp already present in storage.
+- Malformed topics, frames, payloads, candles, and ordering metadata are ignored.
+- A `CLOSE` event must contain a later `new` candle.
 
-- live: Passes the live deque dictionary. Highest performance, highest risk; values can change during the callback.
-- deque_copy: Copies each deque container (elements are shared). Stable container, shared elements.
-- deep_copy: Copies deque containers and each candle dict. Most stable, most overhead.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for ownership and recovery invariants.
 
-Treat the callback payload as read-only unless using deep_copy.
+## Startup and recovery
+
+The SUB listener starts before snapshot requests, so publications that race with
+startup are buffered. Snapshots for a recovery set are validated before any of
+them become visible. Matching buffered events above each `snapshot_seq` are then
+replayed in sequence order.
+
+A transport reconnect, a fresh `RESYNC_REQUIRED`, a new runtime identity, or a
+renewal response from a different runtime triggers recovery. Callback delivery
+pauses while affected events are buffered. A runtime change expands recovery to
+all intervals. Each interval can buffer at most 10,000 events; overflow
+invalidates the in-flight snapshot and forces another recovery attempt rather
+than accepting incomplete data.
+
+Failed recovery preserves the last committed candles and retries. Configure
+`on_critical` to receive recovery failures and repeated renewal failures.
+
+PUB/SUB does not provide durable replay or per-consumer acknowledgement. This
+client restores a consistent current snapshot after recognized disconnects and
+runtime changes; it does not prove receipt of every publication.
+
+## Reading candle data
+
+Callbacks run without the internal data lock held. Choose the callback payload
+mode according to the mutability and performance trade-off:
+
+- `live`: the internal mapping and deques; fastest, but they can change while the
+  callback runs.
+- `deque_copy`: copied deque containers with shared candle dictionaries.
+- `deep_copy`: copied deques and candle dictionaries.
+
+Treat callback values as read-only. Outside callbacks, prefer the public snapshot
+method over direct access to the backward-compatible `candle_deques` property:
 
 ```python
-# Snapshot mode examples
-client = ZMQClient(
-    client_id="my-client",
-    symbol="KRW-BTC",
-    intervals=["1m", "5m", "15m"],
-    candle_handler_callback=on_candle_update,
-    throttle_seconds=0.1,
-    zmq_gateway_host="127.0.0.1",
-    zmq_gateway_req_port=11556,
-    zmq_gateway_pub_port=11558,
-    server_candle_ttl=300,
-    candle_deque_maxlen=200,
-    on_critical=on_critical,
-    callback_snapshot_mode="deque_copy",
-    exchange="upbit",
-)
-
-# concurrency-safe access pattern (inside callback)
-
-def on_candle_update(candle_deques):
-    latest = {k: v[-1] if v else None for k, v in candle_deques.items()}
+snapshot = client.get_candle_snapshot()  # deep_copy by default
+latest_5m = snapshot["5m"][-1] if snapshot["5m"] else None
 ```
+
+## Development
+
+The repository keeps one locked development environment and one CI command set:
+
+```bash
+uv run ruff check .
+uv run ruff format --check .
+uv run pyright
+uv run pytest --cov=sk_zmq --cov-report=term-missing -q
+uv build
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution contract.
